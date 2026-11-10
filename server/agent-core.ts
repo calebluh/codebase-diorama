@@ -1,6 +1,9 @@
 import {
   AGENT_TOOLS,
+  leavesRoom,
   parseReply,
+  plainRequest,
+  spokenRoom,
   systemPrompt,
   validateActions,
   type AgentAction,
@@ -23,6 +26,10 @@ import { createLimiter } from './rate-limit.js';
 export const MODEL_API_BASE = 'https://api.meta.ai/v1';
 const DEFAULT_MODEL = 'muse-spark-1.3';
 const UPSTREAM_TIMEOUT_MS = 14_000;
+/** A spoken answer shorter than this, with nowhere to go, is treated as unfinished. */
+const THIN_ANSWER = 90;
+/** Do not start a second request with less time than this left. */
+const MIN_SECOND_TRY_MS = 3_500;
 
 export interface AgentRequest {
   mapId: string;
@@ -95,10 +102,100 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
     ...(req.history ?? []),
     { role: 'user', content: req.question },
   ];
+  const started = Date.now();
+  const first = await complete(messages, apiKey, model, UPSTREAM_TIMEOUT_MS);
+  let text = first.text;
+  const calls = first.calls;
+  let actions = validateActions(graph, req.nodeId, calls);
+
+  // A quick model sometimes says one line ("here's what I do"), calls a tool
+  // and stops, waiting to hear how the tool went before it carries on. Or it
+  // answers with a single throwaway line. Give it one more turn to finish.
+  const left = UPSTREAM_TIMEOUT_MS - (Date.now() - started);
+  if (!actions.some(leavesRoom) && parseReply(text).answer.length < THIN_ANSWER && left > MIN_SECOND_TRY_MS) {
+    try {
+      if (first.raw.tool_calls?.length) {
+        const more = await complete(
+          [
+            ...messages,
+            { role: 'assistant', content: first.raw.content ?? '', tool_calls: first.raw.tool_calls },
+            ...first.raw.tool_calls.map((c) => ({ role: 'tool', tool_call_id: c.id ?? '', content: 'Done. Now say your full answer to the visitor.' })),
+          ],
+          apiKey,
+          model,
+          left,
+        );
+        // The second turn usually says everything; keep the first line only
+        // when the second is itself short.
+        text = parseReply(more.text).answer.length >= THIN_ANSWER ? more.text : `${parseReply(text).answer} ${more.text}`.trim();
+        actions = validateActions(graph, req.nodeId, [...calls, ...more.calls]);
+      } else {
+        const again = await complete(messages, apiKey, model, left);
+        if (parseReply(again.text).answer.length > parseReply(text).answer.length) {
+          text = again.text;
+          actions = validateActions(graph, req.nodeId, again.calls);
+        }
+      }
+    } catch {
+      // Keep the short answer: it is better than none.
+    }
+  }
+
+  // The model sometimes says "I'm sending you over" and then calls no tool.
+  // When the visitor's words are plain, keep the promise for it.
+  if (!actions.some(leavesRoom)) {
+    const kept = plainRequest(graph, req.nodeId, req.question, text);
+    if (kept) actions.push(kept);
+  }
+  // And sometimes it names one room aloud and calls the tool with another.
+  for (const action of actions) {
+    if (action.type !== 'go_to_room') continue;
+    const said = spokenRoom(graph, req.nodeId, text, action.roomId);
+    if (said) action.roomId = said;
+  }
+  if (!text.trim() && actions.length === 0) throw new AgentError(502, 'Model API returned an empty answer');
+  const reply = parseReply(text);
+  // Promises to move are checked above against the full words; only now is it
+  // safe to drop an opening line that talks about the answer.
+  if (!actions.some(leavesRoom)) reply.answer = dropLeadIn(reply.answer);
+  return { ...reply, actions };
+}
+
+/**
+ * An opening sentence that announces the answer instead of giving it: "I'm on
+ * it - answering what I do here.", "Your cashier's ready - I'll get his
+ * plain-spoken intro."
+ */
+const LEAD_IN =
+  /^[^.!?]{0,140}\b(?:I'll explain|I'll (?:have|let) (?:him|her|them) |I'll (?:get|give) (?:you )?(?:his|her|their|my|a|the) [^.!?]{0,40}(?:intro|answer|run-?down|version|take)|I'm on it|answering what|here(?:'s| is) what I do|plain-spoken)\b[^.!?]{0,140}[.!?]\s+(?=\S)/i;
+
+/** Removes such a sentence when a full answer follows it. */
+export function dropLeadIn(answer: string): string {
+  const rest = answer.replace(LEAD_IN, '');
+  return rest !== answer && rest.length >= THIN_ANSWER ? rest : answer;
+}
+
+interface RawCall {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+}
+interface RawMessage {
+  content?: string | null;
+  tool_calls?: RawCall[];
+}
+
+/** One request to the model: the words it said, the tools it called, and the message as it came. */
+async function complete(
+  messages: unknown[],
+  apiKey: string,
+  model: string,
+  timeoutMs: number,
+): Promise<{ text: string; calls: { name: string; args: Record<string, unknown> }[]; raw: RawMessage }> {
   const response = await fetch(`${MODEL_API_BASE}/chat/completions`, {
     method: 'POST',
     // The headset stops waiting after 15 seconds; do not keep paying after that.
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     // Muse models reason by default; minimal keeps replies to a few seconds.
     // Reasoning tokens count against max_tokens, and a reply that runs out
@@ -116,11 +213,9 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
     const detail = (await response.text()).slice(0, 300);
     throw new AgentError(502, `Model API ${response.status}: ${detail}`);
   }
-  const data = (await response.json()) as {
-    choices?: { message?: { content?: string | null; tool_calls?: { function?: { name?: string; arguments?: string } }[] } }[];
-  };
-  const message = data.choices?.[0]?.message;
-  const calls = (message?.tool_calls ?? []).map((c) => {
+  const data = (await response.json()) as { choices?: { message?: RawMessage }[] };
+  const message = data.choices?.[0]?.message ?? {};
+  const calls = (message.tool_calls ?? []).map((c) => {
     let args: Record<string, unknown> = {};
     try {
       args = JSON.parse(c.function?.arguments || '{}') as Record<string, unknown>;
@@ -129,38 +224,8 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
     }
     return { name: c.function?.name ?? '', args };
   });
-  const leaked = extractLeakedCalls(message?.content ?? '');
-  const actions = validateActions(graph, req.nodeId, [...calls, ...leaked.calls]);
-  const text = leaked.text;
-  const promised = goToFallback(graph, req.nodeId, req.question, text, actions);
-  if (promised) actions.push(promised);
-  if (!text.trim() && actions.length === 0) throw new AgentError(502, 'Model API returned an empty answer');
-  return { ...parseReply(text), actions };
-}
-
-/**
- * The model sometimes promises to send the visitor somewhere ("I'm sending you
- * over") without calling go_to_room. When the visitor asked to go, the reply
- * promises it, and exactly one other room is named, keep the promise.
- */
-function goToFallback(
-  graph: (typeof MAPS)[string],
-  nodeId: string,
-  question: string,
-  answer: string,
-  actions: AgentAction[],
-): AgentAction | null {
-  if (actions.some((a) => a.type === 'go_to_room' || a.type === 'play_flow')) return null;
-  const asked = /\b(take|send|bring|walk) me\b|\bgo to\b|\bvisit\b|\bhead (over|to)\b|\bcan i see\b/i.test(question);
-  const promised = /\b(send(ing)? you|head(ing)? (you )?over|take you|walk you|over you go|let'?s go)\b/i.test(answer);
-  if (!asked || !promised) return null;
-  const haystack = ` ${question.toLowerCase()} `;
-  const named = graph.nodes
-    .filter((n) => n.id !== nodeId)
-    .map((n) => ({ id: n.id, label: n.label.toLowerCase(), singular: n.label.toLowerCase().replace(/s$/, '') }))
-    .filter((n) => haystack.includes(n.label) || new RegExp(`\\b${n.singular}\\b`).test(haystack))
-    .sort((a, b) => b.label.length - a.label.length);
-  return named.length > 0 ? { type: 'go_to_room', roomId: named[0].id } : null;
+  const leaked = extractLeakedCalls(message.content ?? '');
+  return { text: leaked.text, calls: [...calls, ...leaked.calls], raw: message };
 }
 
 const TOOL_NAMES = AGENT_TOOLS.map((t) => t.function.name);

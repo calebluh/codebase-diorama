@@ -28,14 +28,14 @@ import {
 import { ask, speak, speakingSeconds, stopSpeaking, voiceLevel } from '../agent/client.js';
 import { LiveMic } from '../agent/live-mic.js';
 import { canRecord } from '../agent/recorder.js';
-import { suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
+import { leavesRoom, suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
 import { Worker } from '../diorama-components.js';
 import { resolveRef } from '../layout.js';
 import { dive, DIVE_FADE_AT } from '../transition.js';
 import { guideNote } from '../guide.js';
 import { isPaused, onPause, whenResumed } from '../pause.js';
 import { placement } from '../placement.js';
-import { app, currentStep, enterRoom, type Handoff, nextStep, onChange, startFlow, stopFlow } from '../state.js';
+import { app, currentStep, enterRoom, type Handoff, leaveRoom, nextStep, onChange, startFlow, stopFlow } from '../state.js';
 import { arrive, blip, click, pop, setListener, startAmbience, stopAmbience, whoosh } from '../audio/sound.js';
 import { addCeiling, addFloorMarkings, addPilasters, makeSwirl, Trail } from './dressing.js';
 import { thinkingLine } from './lines.js';
@@ -88,6 +88,9 @@ interface WorkerState {
   speechToken: number;
 }
 
+/** How far to either side of straight ahead a robot may stand to talk, in radians. */
+const TALK_ARC = 0.25;
+const TALK_ARC_NARROW = 0.06;
 /** Typing speed of speech bubbles, matched to talking pace. */
 const CHARS_PER_SECOND = 16;
 /** A ready answer waits at most this long for the "let me check" line to finish. */
@@ -652,9 +655,14 @@ export class RoomSystem extends createSystem({
     this.history = [];
     this.questions = suggestedQuestions(app.graph, this.builtNode);
 
-    // Come within comfortable talking distance, in front of the viewer.
+    // Come within comfortable talking distance, in front of the viewer and
+    // inside the gap between the two side panels, which would hide a robot
+    // standing farther round.
     const p = w.rig.root.position;
-    const angle = Math.max(-0.6, Math.min(0.6, Math.atan2(p.x, -p.z)));
+    // A narrow view (glasses) cannot hold a robot off to one side and its
+    // speech bubble at once, so there it stands almost straight ahead.
+    const arc = placement.gaze ? TALK_ARC_NARROW : TALK_ARC;
+    const angle = Math.max(-arc, Math.min(arc, Math.atan2(p.x, -p.z)));
     const spot = new Vector3(Math.sin(angle) * 2.0, 0, -Math.cos(angle) * 2.0);
     w.scripted = true;
     w.item.visible = false;
@@ -733,7 +741,7 @@ export class RoomSystem extends createSystem({
     if (talk !== this.conversation) return;
 
     // Actions that leave the room happen once the worker has finished talking.
-    const leave = reply.actions.find((a) => a.type === 'go_to_room' || a.type === 'play_flow');
+    const leave = reply.actions.find(leavesRoom);
     if (leave) {
       w.rig.gesture('ThumbsUp');
       await new Promise((r) => setTimeout(r, 900));
@@ -747,6 +755,9 @@ export class RoomSystem extends createSystem({
       this.endConversation();
       app.flowIndex = Math.max(0, app.graph.flows.findIndex((f) => f.id === leave.flowId));
       startFlow();
+    } else if (leave?.type === 'back_to_city') {
+      this.endConversation();
+      leaveRoom();
     }
   }
 
@@ -1100,8 +1111,11 @@ export class RoomSystem extends createSystem({
             break;
           }
           // The viewer sits at the room centre: if the straight line passes
-          // too close, walk around the centre on a ring instead.
-          if (this.passesNearViewer(pos, task.to)) {
+          // too close, walk around the centre on a ring instead. The spot
+          // where a robot stands to talk is closer than that, so it is
+          // walked to directly once nothing nearer lies on the way.
+          const keep = Math.min(SAFE_RADIUS, Math.hypot(task.to.x, task.to.z) - 0.05);
+          if (this.passesNearViewer(pos, task.to, keep)) {
             const from = Math.atan2(pos.z, pos.x);
             let diff = Math.atan2(task.to.z, task.to.x) - from;
             while (diff > Math.PI) diff -= Math.PI * 2;
@@ -1180,23 +1194,36 @@ export class RoomSystem extends createSystem({
         if (d >= minGap || d < 1e-4) continue;
         const push = minGap - d;
         const share = a === this.talking ? 0 : b === this.talking ? 1 : 0.5;
+        const ra = Math.hypot(pa.x, pa.z);
+        const rb = Math.hypot(pb.x, pb.z);
         pa.x -= (dx / d) * push * share;
         pa.z -= (dz / d) * push * share;
         pb.x += (dx / d) * push * (1 - share);
         pb.z += (dz / d) * push * (1 - share);
+        this.holdBack(pa, ra);
+        this.holdBack(pb, rb);
       }
     }
   }
 
-  /** True when the straight walk from `a` to `b` comes within SAFE_RADIUS of the viewer. */
-  private passesNearViewer(a: Vector3, b: Vector3): boolean {
+  /** A push from another worker never moves one nearer the seated viewer than the safe distance. */
+  private holdBack(p: Vector3, before: number): void {
+    const r = Math.hypot(p.x, p.z);
+    const least = Math.min(before, SAFE_RADIUS);
+    if (r >= least || r < 1e-4) return;
+    p.x *= least / r;
+    p.z *= least / r;
+  }
+
+  /** True when the straight walk from `a` to `b` comes within `radius` of the viewer. */
+  private passesNearViewer(a: Vector3, b: Vector3, radius: number): boolean {
     const dx = b.x - a.x;
     const dz = b.z - a.z;
     const len2 = dx * dx + dz * dz;
     const t = len2 > 0 ? Math.max(0, Math.min(1, -(a.x * dx + a.z * dz) / len2)) : 0;
     const cx = a.x + dx * t;
     const cz = a.z + dz * t;
-    return cx * cx + cz * cz < SAFE_RADIUS * SAFE_RADIUS;
+    return cx * cx + cz * cz < radius * radius;
   }
 
   /** Rotates toward a heading; returns true once facing it. */
