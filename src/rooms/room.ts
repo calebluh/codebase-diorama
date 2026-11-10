@@ -25,7 +25,7 @@ import {
   type UIKitMLAsset,
   Vector3,
 } from '@iwsdk/core';
-import { ask, speak, stopSpeaking, voiceLevel } from '../agent/client.js';
+import { ask, speak, speakingSeconds, stopSpeaking, voiceLevel } from '../agent/client.js';
 import { LiveMic } from '../agent/live-mic.js';
 import { canRecord } from '../agent/recorder.js';
 import { suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
@@ -33,6 +33,8 @@ import { Worker } from '../diorama-components.js';
 import { resolveRef } from '../layout.js';
 import { dive, DIVE_FADE_AT } from '../transition.js';
 import { guideNote } from '../guide.js';
+import { isPaused, onPause, whenResumed } from '../pause.js';
+import { placement } from '../placement.js';
 import { app, currentStep, enterRoom, type Handoff, nextStep, onChange, startFlow, stopFlow } from '../state.js';
 import { arrive, blip, click, pop, setListener, startAmbience, stopAmbience, whoosh } from '../audio/sound.js';
 import { addCeiling, addFloorMarkings, addPilasters, makeSwirl, Trail } from './dressing.js';
@@ -53,14 +55,13 @@ const WALK_SPEED = 0.8;
 /** Workers keep at least this far from the seated viewer. */
 const SAFE_RADIUS = 2.3;
 const FADE_SECONDS = 0.35;
-/** The viewer sits this far behind the desk centre (see WorkspaceSystem). */
-const VIEWER_OFFSET = 0.5;
 const NAMES = ['Ada', 'Bo', 'Cy', 'Dee', 'Eli', 'Fay', 'Gus', 'Hal', 'Ivy'];
 
 type Task =
   | { kind: 'walk'; to: Vector3 }
   | { kind: 'face'; at: Vector3 }
-  | { kind: 'wait'; seconds: number; say?: string; title?: string }
+  /** Waits `seconds`, or (after a short minimum) until `done` says so. */
+  | { kind: 'wait'; seconds: number; say?: string; title?: string; done?: () => boolean }
   | { kind: 'until'; test: () => boolean }
   | { kind: 'call'; fn: () => void };
 
@@ -89,6 +90,10 @@ interface WorkerState {
 
 /** Typing speed of speech bubbles, matched to talking pace. */
 const CHARS_PER_SECOND = 16;
+/** A ready answer waits at most this long for the "let me check" line to finish. */
+const ACK_GRACE_MS = 1500;
+/** The shortest time a flow step's note stays up, even if the voice was cut off. */
+const MIN_NOTE_SECONDS = 2.5;
 
 interface Station {
   point: Vector3;
@@ -158,6 +163,8 @@ export class RoomSystem extends createSystem({
   private history: ChatTurn[] = [];
   private questions: string[] = [];
   private waiting = false;
+  /** Bumped whenever a conversation starts or ends, so a late answer knows it is stale. */
+  private conversation = 0;
   private mic!: LiveMic;
   /** The visitor turned the mic off for this conversation. */
   private micOff = false;
@@ -172,6 +179,8 @@ export class RoomSystem extends createSystem({
   private fadeTarget = 0;
   /** True while a room's props are loading behind the fade. */
   private preparing = false;
+  /** The building whose props were last fetched ahead of stepping inside. */
+  private prefetched: string | null = null;
 
   // Scratch.
   private head = new Vector3();
@@ -202,6 +211,15 @@ export class RoomSystem extends createSystem({
     this.world.createTransformEntity(this.fade, { persistent: true });
     this.cleanupFuncs.push(onChange(() => this.onStateChange()));
     this.wireAskPanel();
+    // Headset off or the system menu up: close the microphone, and open it
+    // again on return if a conversation is still going.
+    this.cleanupFuncs.push(
+      onPause((paused) => {
+        if (paused) this.mic?.stop();
+        else if (this.talking) void this.openMic();
+        this.updateMicLabel();
+      }),
+    );
     this.cleanupFuncs.push(
       this.queries.hoveredWorkers.subscribe('qualify', (entity) => {
         const worker = this.workers.find((w) => w.entity === entity);
@@ -223,8 +241,48 @@ export class RoomSystem extends createSystem({
   }
 
   private onStateChange(): void {
+    if (app.stepIndex < 0 && this.handledStep >= 0) this.dropStep();
+    this.prefetchSelected();
     if (this.desiredNode() !== this.builtNode) this.fadeTarget = 1;
     else this.maybeHandleStep();
+  }
+
+  /**
+   * A building was picked on the table: start downloading its room's props
+   * now, so stepping inside is not a long wait in the dark.
+   */
+  private prefetchSelected(): void {
+    const id = app.selected;
+    if (app.mode !== 'table' || !id || id === this.prefetched) return;
+    this.prefetched = id;
+    void loadProps(propsForTheme(pickTheme(app.graph, id)));
+  }
+
+  /** The flow was stopped part-way through a step: put the packet away and free the lead. */
+  private dropStep(): void {
+    this.handledStep = -1;
+    const packet = this.packet;
+    if (packet) {
+      packet.flying = false;
+      packet.held = false;
+      packet.onArrive = null;
+      packet.group.visible = false;
+    }
+    const lead = this.workers[0];
+    if (!lead || lead === this.talking) return;
+    if (lead.speech && !this.talking) stopSpeaking();
+    this.hush(lead);
+    lead.queue = [];
+    lead.clock = 0;
+    lead.scripted = false;
+  }
+
+  /** Ends whatever line a worker is saying or showing. */
+  private hush(w: WorkerState): void {
+    w.speechToken += 1;
+    w.speech = null;
+    w.mood = 'idle';
+    w.bubble.setText('');
   }
 
   // ------------------------------------------------------------- building
@@ -242,7 +300,7 @@ export class RoomSystem extends createSystem({
     const staticGroup = new Group();
     staticGroup.name = 'static';
     group.add(staticGroup);
-    group.position.set(0, -(this.workspace?.position.y ?? 0.74), VIEWER_OFFSET);
+    group.position.set(0, -(this.workspace?.position.y ?? 0.74), placement.reach);
 
     const floor = new Mesh(new CircleGeometry(ROOM_RADIUS, 48), new MeshStandardMaterial({ color: theme.floor, roughness: 0.85 }));
     floor.rotation.x = -Math.PI / 2;
@@ -459,10 +517,8 @@ export class RoomSystem extends createSystem({
 
     // Sent here by another worker: someone comes over to pick up the thread.
     const handoff = app.handoff;
-    if (handoff?.toRoom === nodeId) {
-      app.handoff = null;
-      this.startConversation(this.workers[1], handoff);
-    }
+    app.handoff = null; // for this room or not, it is used up
+    if (handoff?.toRoom === nodeId) this.startConversation(this.workers[1], handoff);
   }
 
   private teardown(): void {
@@ -562,12 +618,16 @@ export class RoomSystem extends createSystem({
    * Says a line: the bubble types it out at speaking pace while the voice
    * reads it, and the worker gestures until it is done.
    */
-  private say(w: WorkerState, text: string, title: string): Promise<void> {
+  private async say(w: WorkerState, text: string, title: string): Promise<void> {
+    const token = ++w.speechToken;
+    // An answer that arrives while the headset is off waits for the visitor.
+    await whenResumed();
+    if (w.speechToken !== token) return;
+    if (import.meta.env.DEV) console.log(`[say] ${w.name}: ${text.slice(0, 70)}`);
     w.speech = { text, title, start: performance.now() / 1000 };
     const mouth = w.rig.root.getWorldPosition(new Vector3()).setY(1.1);
     blip(mouth);
     w.mood = 'talking';
-    const token = ++w.speechToken;
     return speak(text, this.hash(w.name), mouth).then(() => {
       if (w.speechToken !== token) return;
       w.mood = 'idle';
@@ -626,6 +686,7 @@ export class RoomSystem extends createSystem({
     const w = this.talking;
     if (!question || !w || !this.builtNode || !this.theme || this.waiting) return;
     this.waiting = true;
+    const talk = this.conversation;
     this.hideFileCard();
     const nodeId = this.builtNode;
     const persona = { name: w.name, role: this.theme.role, place: this.theme.place };
@@ -636,9 +697,13 @@ export class RoomSystem extends createSystem({
       if (this.waiting && this.talking === w) w.mood = 'thinking';
     });
     const reply = await ask(app.mapId, app.graph, nodeId, persona, question, this.history);
-    await ack;
+    // Left, or started over with someone else, while waiting: that already
+    // reset `waiting`, and this answer belongs to nobody now.
+    if (talk !== this.conversation) return;
+    // Let the "let me check" line finish, but never keep a ready answer waiting.
+    await Promise.race([ack, new Promise((r) => setTimeout(r, ACK_GRACE_MS))]);
+    if (talk !== this.conversation) return;
     this.waiting = false;
-    if (this.talking !== w || this.builtNode !== nodeId) return; // left while waiting
     guideNote('asked');
 
     this.history.push({ role: 'user', content: question }, { role: 'assistant', content: reply.answer });
@@ -665,14 +730,14 @@ export class RoomSystem extends createSystem({
 
     const answer = reply.answer || 'Right this way.';
     await this.say(w, answer, this.titleFor(w, reply.offline ? ' (offline)' : ''));
-    if (this.talking !== w || this.builtNode !== nodeId) return;
+    if (talk !== this.conversation) return;
 
     // Actions that leave the room happen once the worker has finished talking.
     const leave = reply.actions.find((a) => a.type === 'go_to_room' || a.type === 'play_flow');
     if (leave) {
       w.rig.gesture('ThumbsUp');
       await new Promise((r) => setTimeout(r, 900));
-      if (this.talking !== w) return;
+      if (talk !== this.conversation) return;
     }
     if (leave?.type === 'go_to_room') {
       app.handoff = { toRoom: leave.roomId, fromWorker: w.name, fromRoom: app.graph.nodes.find((n) => n.id === nodeId)?.label ?? nodeId, question, answer };
@@ -721,7 +786,7 @@ export class RoomSystem extends createSystem({
 
   /** Opens the mic for a conversation, unless it is unavailable or switched off. */
   private async openMic(): Promise<void> {
-    if (!canRecord() || this.micOff || this.mic.active) return;
+    if (!canRecord() || this.micOff || this.mic.active || isPaused()) return;
     try {
       await this.mic.start(this.micKeywords());
     } catch {
@@ -774,12 +839,11 @@ export class RoomSystem extends createSystem({
     const w = this.talking;
     this.talking = null;
     this.waiting = false;
+    this.conversation += 1;
     if (!w) return;
-    w.speechToken += 1;
-    w.speech = null;
-    w.mood = 'idle';
-    w.bubble.setText('');
+    this.hush(w);
     w.queue = [];
+    w.clock = 0;
     w.scripted = false;
   }
 
@@ -803,11 +867,13 @@ export class RoomSystem extends createSystem({
     packet.held = false;
     packet.flying = false;
 
-    // Drop whatever the lead was doing.
+    // Drop whatever the lead was doing, a chat with the visitor included.
+    if (lead === this.talking) this.endConversation();
     lead.scripted = true;
     lead.queue = [];
+    lead.clock = 0;
     lead.item.visible = false;
-    lead.bubble.setText('');
+    this.hush(lead);
     const stepTitle = `${this.theme!.role} ${lead.name} · step ${index + 1} of ${app.flowSteps.length}`;
 
     const tasks: Task[] = [];
@@ -821,10 +887,29 @@ export class RoomSystem extends createSystem({
     } else {
       tasks.push({ kind: 'call', fn: () => this.hold(lead) });
     }
+    // At the desk the lead says what happens in this step, out loud unless
+    // the visitor is in the middle of a conversation with someone else.
+    const read: Extract<Task, { kind: 'wait' }> = { kind: 'wait', seconds: 3.6 };
     tasks.push(
       { kind: 'walk', to: desk.spots[0] },
       { kind: 'face', at: desk.faces[0] },
-      { kind: 'wait', seconds: 3.6, say: step.note, title: stepTitle },
+      {
+        kind: 'call',
+        fn: () => {
+          if (this.talking) {
+            lead.bubble.setText(step.note, stepTitle);
+            return;
+          }
+          let spoken = false;
+          read.seconds = Math.min(16, speakingSeconds(step.note) + 4);
+          read.done = () => spoken;
+          void this.say(lead, step.note, stepTitle).then(() => {
+            spoken = true;
+          });
+        },
+      },
+      read,
+      { kind: 'call', fn: () => this.hush(lead) },
     );
     if (outPortal) {
       tasks.push(
@@ -914,6 +999,7 @@ export class RoomSystem extends createSystem({
   // ---------------------------------------------------------------- frame
 
   update(delta: number, time: number): void {
+    if (isPaused()) return; // headset off or system menu up: hold everything still
     this.updateFade(delta);
     dive.roomShown = this.roomGroup !== null;
     if (!this.roomGroup) return;
@@ -1039,7 +1125,7 @@ export class RoomSystem extends createSystem({
         case 'wait':
           if (w.clock === 0 && task.say) w.bubble.setText(task.say, task.title);
           w.clock += delta;
-          if (w.clock >= task.seconds) {
+          if (w.clock >= task.seconds || (task.done?.() && w.clock >= MIN_NOTE_SECONDS)) {
             w.clock = 0;
             if (task.say) w.bubble.setText('');
             w.queue.shift();
@@ -1072,7 +1158,7 @@ export class RoomSystem extends createSystem({
   /** Drives the character's animation from what the worker is doing. */
   private applyPose(w: WorkerState, walking: boolean, delta: number): void {
     const carrying = w.item.visible || (this.packet?.held === true && this.packet.group.parent === w.rig.hands);
-    w.rig.mouthLevel = w === this.talking && w.mood === 'talking' ? voiceLevel() : -1;
+    w.rig.mouthLevel = w.mood === 'talking' ? voiceLevel() : -1;
     w.rig.update(delta, walking, WALK_SPEED, w.mood, carrying);
   }
 

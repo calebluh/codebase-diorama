@@ -21,6 +21,9 @@ import type { GraphData } from './maps/types.js';
 import { ignoreRays } from './rays.js';
 import { Bubble } from './rooms/worker.js';
 import { app } from './state.js';
+import { HACKATHON } from './edition.js';
+import { isPaused } from './pause.js';
+import { aimWord, placement } from './placement.js';
 import { dive } from './transition.js';
 
 /**
@@ -30,7 +33,10 @@ import { dive } from './transition.js';
  * finishes when the visitor actually does it, and steps they do early are
  * skipped, so nobody has to read ahead or press Next.
  *
- * Shown once per browser; development key `u` starts it over.
+ * The competition build shows it on every visit (a headset is often passed
+ * around); the personal edition shows it once per browser. `?guide=0` in the
+ * address turns it off and `?guide=1` turns it on; development key `u`
+ * starts it over.
  */
 
 type Target = 'building' | 'worker' | null;
@@ -57,7 +63,7 @@ const STEPS: Step[] = [
   },
   {
     title: 'Point and pinch',
-    text: () => 'Point at the building with the arrow, then tap your thumb and finger together.',
+    text: () => `${aimWord()} the building with the arrow, then tap your thumb and finger together.`,
     done: () => app.selected !== null || app.mode === 'room' || guideProgress.talked,
     target: 'building',
     pinch: true,
@@ -71,7 +77,7 @@ const STEPS: Step[] = [
   },
   {
     title: 'Meet the team',
-    text: () => 'The robots here run this part of the code. Point at one and pinch to talk.',
+    text: () => `The robots here run this part of the code. ${aimWord()} one and pinch to talk.`,
     done: () => guideProgress.talked,
     target: 'worker',
     pinch: true,
@@ -94,7 +100,10 @@ const STEPS: Step[] = [
   },
   {
     title: 'Make it yours',
-    text: () => 'Pinch the board with both hands, then pull apart to resize it or twist to turn it.',
+    text: () =>
+      placement.gaze
+        ? 'Every building, button and robot works the same way: look at it and pinch.'
+        : 'Pinch the board with both hands, then pull apart to resize it or twist to turn it.',
     done: (clock, grabbed) => grabbed || clock > 15,
     target: null,
     pinch: true,
@@ -174,7 +183,8 @@ export class GuideSystem extends createSystem({
     this.world.createTransformEntity(this.holder, { persistent: true });
     this.world.createTransformEntity(this.arrow, { persistent: true });
 
-    this.active = !this.seen();
+    const wanted = new URLSearchParams(location.search).get('guide');
+    this.active = wanted === '0' ? false : wanted === '1' || HACKATHON || !this.seen();
   }
 
   private seen(): boolean {
@@ -218,6 +228,7 @@ export class GuideSystem extends createSystem({
   }
 
   update(delta: number, time: number): void {
+    if (isPaused()) return;
     if (guideProgress.restart) {
       guideProgress.restart = false;
       this.active = true;

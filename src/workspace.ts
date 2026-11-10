@@ -6,10 +6,8 @@ import {
   Vector3,
   VisibilityState,
 } from '@iwsdk/core';
+import { FAR, NEAR, placement } from './placement.js';
 
-/** How far in front of the eyes the desk's centre sits, and how far below. */
-const REACH = 0.5;
-const DROP = 0.42;
 /** Frames to wait after entering VR so the headset pose has settled. */
 const SETTLE_FRAMES = 12;
 
@@ -17,7 +15,8 @@ const SETTLE_FRAMES = 12;
  * Keeps the desk, diorama and panels (the scene's `workspace` node) within
  * comfortable reach, whether the user is seated or standing. On entering VR,
  * and whenever Recenter is pressed, the workspace moves to just below and in
- * front of the head and turns to face it. Leaving VR restores the authored
+ * front of the head and turns to face it (how far is in `placement.ts`).
+ * Leaving VR restores the authored
  * position used by the desktop browser view.
  */
 export class WorkspaceSystem extends createSystem({}) {
@@ -25,6 +24,7 @@ export class WorkspaceSystem extends createSystem({}) {
   private homePosition = new Vector3();
   private homeYaw = 0;
   private pendingFrames = -1;
+  private immersive = false;
   private head = new Vector3();
   private headQuat = new Quaternion();
   private forward = new Vector3();
@@ -38,10 +38,17 @@ export class WorkspaceSystem extends createSystem({}) {
     this.cleanupFuncs.push(
       this.world.visibilityState.subscribe((state) => {
         if (state === VisibilityState.NonImmersive) {
+          this.immersive = false;
           this.pendingFrames = -1;
+          placement.reach = NEAR.reach;
+          placement.drop = NEAR.drop;
+          placement.gaze = false;
           this.workspace!.position.copy(this.homePosition);
           this.workspace!.rotation.set(0, this.homeYaw, 0);
-        } else if (state === VisibilityState.Visible && this.pendingFrames < 0) {
+        } else if (state === VisibilityState.Visible && !this.immersive) {
+          // Only on entering VR. Coming back from the Quest menu or putting the
+          // headset back on must not move a desk the visitor already placed.
+          this.immersive = true;
           this.pendingFrames = SETTLE_FRAMES;
         }
       }),
@@ -64,6 +71,12 @@ export class WorkspaceSystem extends createSystem({}) {
 
   private placeInFrontOfHead(): void {
     if (!this.workspace) return;
+    // A session that was granted gaze tracking is running on glasses.
+    const gaze = this.world.session?.enabledFeatures?.includes('gaze-tracking') ?? false;
+    const { reach, drop } = gaze ? FAR : NEAR;
+    placement.reach = reach;
+    placement.drop = drop;
+    placement.gaze = gaze;
     const head = this.player.head;
     head.getWorldPosition(this.head);
     head.getWorldQuaternion(this.headQuat);
@@ -73,9 +86,9 @@ export class WorkspaceSystem extends createSystem({}) {
     this.forward.normalize();
 
     this.workspace.position.set(
-      this.head.x + this.forward.x * REACH,
-      Math.max(this.head.y - DROP, 0.45),
-      this.head.z + this.forward.z * REACH,
+      this.head.x + this.forward.x * reach,
+      Math.max(this.head.y - drop, 0.45),
+      this.head.z + this.forward.z * reach,
     );
     // Turn the desk so its front edge (+Z) faces back toward the viewer.
     this.workspace.rotation.set(0, Math.atan2(-this.forward.x, -this.forward.z), 0);
