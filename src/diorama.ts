@@ -9,6 +9,7 @@ import {
   EdgesGeometry,
   type Entity,
   Grabbed,
+  InputComponent,
   Group,
   Hovered,
   InstancedMesh,
@@ -26,6 +27,7 @@ import {
   RepeatWrapping,
   SphereGeometry,
   SRGBColorSpace,
+  TorusGeometry,
   TubeGeometry,
   TwoHandsGrabbable,
   type UIKit,
@@ -35,8 +37,12 @@ import {
 import { click } from './audio/sound.js';
 import { KIND_COLORS } from './colors.js';
 import { HACKATHON } from './edition.js';
+import { inPassthrough } from './passthrough.js';
+import { placement } from './placement.js';
 import { setPanelShown } from './panels.js';
 import { ignoreRays } from './rays.js';
+import { buildRooftops } from './rooftops.js';
+import { classifyHop, HOP_COLORS, HOP_TAGS, type HopKind } from './network.js';
 import { mergeGeometries } from './rooms/merge.js';
 import { District } from './diorama-components.js';
 import { isPaused } from './pause.js';
@@ -210,6 +216,10 @@ export class DioramaSystem extends createSystem({
   private shownStep = -1;
   private stepClock = 0;
   private hopCurve = new QuadraticBezierCurve3();
+  /** Where requests from the internet come in: the top of the gateway, in board space. */
+  private gatePoint = new Vector3();
+  /** The current flow step's hop: across the network, into stored data, or inside the code. */
+  private hop: { kind: HopKind; detail: string } | null = null;
   private pulse!: Mesh;
 
   private inspector: UIKitMLAsset | undefined;
@@ -347,7 +357,8 @@ export class DioramaSystem extends createSystem({
           t.needsUpdate = true;
         }
       }
-      const mesh = new Mesh(unitBox, material);
+      // Data stores are round silos; everything else is a block.
+      const mesh = new Mesh(d.isLeaf && d.kind === 'data' ? unitTower : unitBox, material);
       mesh.name = `district:${d.id}`;
       mesh.position.set(d.rect.x + d.rect.w / 2, d.base, d.rect.z + d.rect.d / 2);
       mesh.scale.set(d.rect.w, d.height, d.rect.d);
@@ -357,6 +368,8 @@ export class DioramaSystem extends createSystem({
         : new Vector3(mesh.position.x, d.base + d.height + 0.004, d.rect.z + d.rect.d - 0.008);
       addSite(d.id, mesh, material, roof, d.depth === 0 ? 0.02 : 0.016, d.isLeaf ? 5 : 1);
     }
+
+    group.add(buildRooftops(this.layout.districts.values()));
 
     for (const s of this.layout.externals.values()) {
       const material = new MeshStandardMaterial({
@@ -439,6 +452,8 @@ export class DioramaSystem extends createSystem({
     }
 
     if (graph.project.logo) this.addLogoPlaque(group, graph.project.logo);
+
+    this.addGateway(group);
 
     // The pulse that travels along a flow.
     this.pulse = new Mesh(new SphereGeometry(0.0055, 16, 12), new MeshBasicMaterial({ color: '#ffffff' }));
@@ -572,7 +587,8 @@ export class DioramaSystem extends createSystem({
     // Inside a room the desk would hide the floor; the panels stay.
     const desk = this.world.getSceneObject('desk');
     // The desk drops away as a dive starts, so the city rises around the viewer.
-    if (desk) desk.visible = onTable && this.diveDir === 0;
+    // In mixed reality the visitor's own desk takes its place.
+    if (desk) desk.visible = onTable && this.diveDir === 0 && !inPassthrough(this.world);
     for (const label of this.labels) label.visible = this.diveDir === 0;
   }
 
@@ -627,6 +643,9 @@ export class DioramaSystem extends createSystem({
   private updateDive(delta: number): void {
     if (this.surfaceFrom && !dive.roomShown) {
       // The room is gone behind the dark: start huge and shrink to the desk.
+      // The visitor may have turned around inside the room, so the desk
+      // comes back in front of them first, unseen.
+      placement.recentre();
       const from = this.surfaceFrom;
       this.surfaceFrom = null;
       this.root.object3D!.visible = true;
@@ -773,14 +792,15 @@ export class DioramaSystem extends createSystem({
     const flow = currentFlow()!;
     const step = currentStep()!;
     const node = app.graph.nodes.find((n) => n.id === step.nodeId)!;
+    const hop = this.hop;
     this.setText(
       this.inspector,
       'insp-kind',
-      `${flow.title.toUpperCase()} · STEP ${app.stepIndex + 1} OF ${app.flowSteps.length}`,
+      `STEP ${app.stepIndex + 1} OF ${app.flowSteps.length}${hop ? ` · ${HOP_TAGS[hop.kind]}` : ` · ${flow.title.toUpperCase()}`}`,
     );
     this.setText(this.inspector, 'insp-title', node.label);
     this.setText(this.inspector, 'insp-summary', step.note);
-    this.setText(this.inspector, 'insp-stats', node.summary);
+    this.setText(this.inspector, 'insp-stats', hop ? `${hop.detail} ${node.summary}` : node.summary);
     this.setShown('insp-alert-box', false);
     this.setShown('insp-recent-box', false);
     this.setShown('insp-files', false);
@@ -873,15 +893,48 @@ export class DioramaSystem extends createSystem({
     const step = currentStep()!;
     const site = this.sitesById.get(step.nodeId);
     if (!site) return;
-    const prevId = app.flowSteps[app.stepIndex - 1]?.nodeId;
-    const from = (prevId && this.sitesById.get(prevId)?.roof) || site.roof;
+    const prevId = app.flowSteps[app.stepIndex - 1]?.nodeId ?? null;
+    const hop = classifyHop(app.graph, prevId, step.nodeId);
+    this.hop = hop;
+    // A request from the internet comes in through the gateway.
+    const from = hop.kind === 'entry' ? this.gatePoint : (prevId && this.sitesById.get(prevId)?.roof) || site.roof;
     const to = site.roof;
     this.hopCurve.v0.copy(from);
     this.hopCurve.v2.copy(to);
     this.hopCurve.v1.copy(from).lerp(to, 0.5);
-    this.hopCurve.v1.y = Math.max(from.y, to.y) + 0.035 + from.distanceTo(to) * 0.4;
-    this.stepClock = app.stepIndex === 0 ? HOP_SECONDS : 0;
+    // Network hops fly high over the city; work inside the code stays low.
+    const lift = hop.kind === 'local' ? 0.012 + from.distanceTo(to) * 0.15 : hop.kind === 'storage' ? 0.025 + from.distanceTo(to) * 0.25 : 0.05 + from.distanceTo(to) * 0.5;
+    this.hopCurve.v1.y = Math.max(from.y, to.y) + lift;
+    (this.pulse.material as MeshBasicMaterial).color.set(HOP_COLORS[hop.kind]);
+    this.pulse.scale.setScalar(hop.kind === 'local' ? 0.75 : 1);
+    this.stepClock = app.stepIndex === 0 && hop.kind !== 'entry' ? HOP_SECONDS : 0;
     this.pulse.visible = true;
+  }
+
+  /**
+   * The gateway on the front-right corner of the board: where requests from
+   * the internet come in, and the start of every flow that begins in a
+   * browser or at a server.
+   */
+  private addGateway(group: Group): void {
+    const w = this.layout.width;
+    const front = -0.04 + (this.layout.depth + 0.16) / 2;
+    const x = w / 2 - 0.035;
+    const z = front - 0.035;
+    const material = new MeshStandardMaterial({ color: '#5ce1ff', emissive: new Color('#5ce1ff'), emissiveIntensity: 0.9, roughness: 0.4 });
+    const arch = new Mesh(new TorusGeometry(0.022, 0.0035, 8, 24, Math.PI), material);
+    arch.position.set(x, 0.03, z);
+    group.add(ignoreRays(arch));
+    for (const side of [-1, 1]) {
+      const post = new Mesh(new CylinderGeometry(0.0035, 0.0035, 0.03, 8), material);
+      post.position.set(x + side * 0.022, 0.015, z);
+      group.add(ignoreRays(post));
+    }
+    const label = makeLabel('Internet', 0.016, '#5ce1ff');
+    label.position.set(x, 0.07, z);
+    group.add(ignoreRays(label));
+    this.labels.push(label);
+    this.gatePoint.set(x, 0.03, z);
   }
 
   // --------------------------------------------------------------- frame
@@ -906,6 +959,18 @@ export class DioramaSystem extends createSystem({
       if (Math.abs(scale.z - start) > Math.abs(next - start)) next = scale.z;
       this.uniformScale = Math.min(3, Math.max(0.5, next));
       scale.setScalar(this.uniformScale);
+    }
+
+    // Controllers: the right thumbstick spins the city (left and right) and
+    // resizes it (up and down), when it is not being held.
+    const stick = this.input.xr.gamepads.right?.getAxesValues(InputComponent.Thumbstick);
+    if (stick && !grabbed && (Math.abs(stick.x) > 0.2 || Math.abs(stick.y) > 0.2)) {
+      const obj = this.root.object3D!;
+      if (Math.abs(stick.x) > 0.2) obj.rotation.y -= stick.x * 1.4 * delta;
+      if (Math.abs(stick.y) > 0.2) {
+        this.uniformScale = Math.min(3, Math.max(0.5, this.uniformScale * (1 - stick.y * 0.9 * delta)));
+        obj.scale.setScalar(this.uniformScale);
+      }
     }
 
     // Labels turn to face the viewer.

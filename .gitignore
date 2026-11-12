@@ -51,3 +51,7 @@ maps-src/
 
 # Vercel
 .vercel/
+
+.vercel
+.env*
+.playwright-mcp/

@@ -30,7 +30,7 @@ import { LiveMic } from '../agent/live-mic.js';
 import { canRecord } from '../agent/recorder.js';
 import { leavesRoom, plainRequest, suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
 import { answerOrder, asksForQuiz, asksToStopQuiz, heardAnswer, quizRound, type QuizQuestion } from '../agent/quiz.js';
-import { Worker } from '../diorama-components.js';
+import { Carryable, Pipe, Worker } from '../diorama-components.js';
 import { resolveRef } from '../layout.js';
 import { dive, DIVE_FADE_AT } from '../transition.js';
 import { guideNote } from '../guide.js';
@@ -52,11 +52,31 @@ const ROOM_RADIUS = 5.2;
 const WALL_HEIGHT = 3.4;
 const STATION_RADIUS = 3.3;
 const PORTAL_RADIUS = 5.05;
+/** Where the lead stands to hand the visitor the request, and how long it waits. */
+const OFFER_SPOT = new Vector3(0.45, 0, -1.3);
+const OFFER_SECONDS = import.meta.env.DEV ? 40 : 10;
+
+/** The request held out to the visitor during a flow (see RoomSystem.offerPacket). */
+interface Offer {
+  lead: WorkerState;
+  portal: Portal;
+  next: string;
+  /** When the lead stops waiting and sends it itself (seconds, performance clock). */
+  deadline: number;
+  carrying: boolean;
+  sending: boolean;
+}
 const WALK_SPEED = 0.8;
 /** Workers keep at least this far from the seated viewer. */
 const SAFE_RADIUS = 2.3;
 const FADE_SECONDS = 0.35;
-const NAMES = ['Ada', 'Bo', 'Cy', 'Dee', 'Eli', 'Fay', 'Gus', 'Hal', 'Ivy'];
+/** Short, easy to say and to hear, from many places. */
+const NAMES = [
+  'Ada', 'Bo', 'Cy', 'Dee', 'Eli', 'Fay', 'Gus', 'Hal', 'Ivy', 'Jun',
+  'Kai', 'Lena', 'Milo', 'Nia', 'Omar', 'Pia', 'Quinn', 'Rosa', 'Sami', 'Tess',
+  'Uma', 'Vik', 'Wren', 'Yara', 'Zed', 'Aiko', 'Bram', 'Chloe', 'Dev', 'Esme',
+  'Femi', 'Greta', 'Hugo', 'Ines', 'Jonah', 'Kofi', 'Luca', 'Mira', 'Noor', 'Otto',
+];
 
 type Task =
   | { kind: 'walk'; to: Vector3 }
@@ -84,7 +104,8 @@ interface WorkerState {
   /** What the worker is doing with their body, beyond walking and carrying. */
   mood: Mood;
   /** The line being typed into the bubble, if any. */
-  speech: { text: string; title: string; start: number } | null;
+  /** The line being said: typed out from `start` (when the voice began) at `rate` characters a second. */
+  speech: { text: string; title: string; start: number; rate: number } | null;
   /** Bumped whenever a new line starts, so a finished old line does not reset the mood. */
   speechToken: number;
 }
@@ -124,6 +145,8 @@ interface Portal {
   mouth: Vector3;
   /** Floor spot in front of it where a worker waits. */
   landing: Vector3;
+  /** The swirl inside the tube: pinch it to send the request this way. */
+  hole: Mesh;
 }
 
 interface Packet {
@@ -171,6 +194,8 @@ const WRONG_LINES = ['Not quite.', 'Not that one.', 'Close, but no.', 'Afraid no
  */
 export class RoomSystem extends createSystem({
   pressedWorkers: { required: [Worker, Pressed] },
+  pressedPacket: { required: [Carryable, Pressed] },
+  pressedPipes: { required: [Pipe, Pressed] },
   hoveredWorkers: { required: [Worker, Hovered] },
 }) {
   private workspace: Object3D | undefined;
@@ -184,6 +209,10 @@ export class RoomSystem extends createSystem({
   private bubbles: Bubble[] = [];
   /** The sign on the far wall, and what it says outside a quiz. */
   private sign: { bubble: Bubble; text: string; title: string } | null = null;
+  /** The worker's latest line and until when the mic may still hear it (seconds). */
+  private lastSaid: { text: string; until: number } | null = null;
+  /** Counts the visitor cutting in, so an interrupted answer's actions are dropped. */
+  private cutIns = 0;
   private packet: Packet | null = null;
   private handledStep = -1;
   private offRoomClock = 0;
@@ -204,6 +233,13 @@ export class RoomSystem extends createSystem({
   private micOff = false;
   private fileCard: Bubble | null = null;
   private swirls: Mesh[] = [];
+  /** Pinchable pipes and the invisible catch area around the request (see offerPacket). */
+  private pipeEntities: Entity[] = [];
+  private catcher: Entity | null = null;
+  /** The request held out to the visitor during a flow, until it goes down the next pipe. */
+  private offer: Offer | null = null;
+  /** The visitor has been told once how to carry the request. */
+  private taughtCarry = false;
   private trail: Trail | null = null;
 
   // Fade between rooms: a dark sphere around the head.
@@ -267,6 +303,8 @@ export class RoomSystem extends createSystem({
         const worker = this.workers.find((w) => w.entity === entity);
         if (worker && worker !== this.talking) this.startConversation(worker);
       }),
+      this.queries.pressedPacket.subscribe('qualify', () => this.takePacket()),
+      this.queries.pressedPipes.subscribe('qualify', (entity) => this.sendPacketTo(entity.getValue(Pipe, 'nodeId') as string)),
     );
   }
 
@@ -295,6 +333,7 @@ export class RoomSystem extends createSystem({
   /** The flow was stopped part-way through a step: put the packet away and free the lead. */
   private dropStep(): void {
     this.handledStep = -1;
+    this.endOffer();
     const packet = this.packet;
     if (packet) {
       packet.flying = false;
@@ -335,6 +374,13 @@ export class RoomSystem extends createSystem({
     staticGroup.name = 'static';
     group.add(staticGroup);
     group.position.set(0, -(this.workspace?.position.y ?? 0.74), placement.reach);
+    // The visitor may have moved the desk: centre the room under their head.
+    if (this.workspace) {
+      this.world.camera.getWorldPosition(this.head);
+      this.workspace.worldToLocal(this.head);
+      group.position.x = this.head.x;
+      group.position.z = this.head.z;
+    }
 
     const floor = new Mesh(new CircleGeometry(ROOM_RADIUS, 48), new MeshStandardMaterial({ color: theme.floor, roughness: 0.85 }));
     floor.rotation.x = -Math.PI / 2;
@@ -455,13 +501,28 @@ export class RoomSystem extends createSystem({
       group.add(label.mesh);
       this.bubbles.push(label);
       const landing = new Vector3(Math.sin(a) * (PORTAL_RADIUS - 0.9), 0, -Math.cos(a) * (PORTAL_RADIUS - 0.9));
-      return { nodeId: id, mouth, landing };
+      return { nodeId: id, mouth, landing, hole };
     });
 
     const folded = mergeStatic(staticGroup);
     if (import.meta.env.DEV) console.log(`[perf] merged ${folded} static meshes in ${nodeId}`);
     this.roomGroup = group;
     this.roomEntity = this.world.createTransformEntity(group, workspaceEntity ? { parent: workspaceEntity } : undefined);
+    // Pipes take a pinch while the visitor carries a request (see sendPacketTo).
+    for (const p of this.portals) {
+      p.hole.name = `pipe:${p.nodeId}`;
+      const pipe = this.world.createTransformEntity(p.hole, { parent: this.roomEntity });
+      pipe.addComponent(Pipe, { nodeId: p.nodeId });
+      pipe.addComponent(RayInteractable);
+      this.pipeEntities.push(pipe);
+    }
+    const catchArea = new Mesh(
+      new SphereGeometry(0.24, 12, 8),
+      new MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+    );
+    catchArea.name = 'request';
+    this.catcher = this.world.createTransformEntity(catchArea, { parent: this.roomEntity });
+    this.catcher.addComponent(Carryable, { nodeId });
 
     // Staff: three workers looping between stations.
     this.workers = [0, 1, 2].map((i) => {
@@ -574,6 +635,11 @@ export class RoomSystem extends createSystem({
     this.builtNode = null;
     this.stations = [];
     this.portals = [];
+    for (const e of this.pipeEntities) e.dispose();
+    this.pipeEntities = [];
+    this.catcher?.dispose();
+    this.catcher = null;
+    this.offer = null;
     this.swirls = [];
     this.trail = null;
   }
@@ -613,16 +679,27 @@ export class RoomSystem extends createSystem({
     this.mic = new LiveMic({
       onSpeechStart: () => {
         const w = this.talking;
-        if (w && !this.waiting) {
+        // While the worker talks this may be its own voice: wait for words.
+        if (w && !this.waiting && w.mood !== 'talking') {
           w.mood = 'listening';
           w.bubble.setText('...', 'YOU');
         }
       },
       onPartial: (text) => {
         const w = this.talking;
-        if (w && !this.waiting) w.bubble.setText(text, 'YOU');
+        if (!w || this.waiting || this.isEcho(text)) return;
+        // The visitor is cutting in: stop talking and listen.
+        if (w.mood === 'talking') {
+          if (text.trim().split(/s+/).length < 2) return;
+          this.interrupt(w);
+        }
+        w.bubble.setText(text, 'YOU');
       },
-      onTurn: (text) => this.heard(text),
+      onTurn: (text) => {
+        if (this.isEcho(text)) return;
+        if (this.talking?.mood === 'talking') this.interrupt(this.talking);
+        this.heard(text);
+      },
       onMode: () => this.updateMicLabel(),
     });
   }
@@ -666,13 +743,22 @@ export class RoomSystem extends createSystem({
     await whenResumed();
     if (w.speechToken !== token) return;
     if (import.meta.env.DEV) console.log(`[say] ${w.name}: ${text.slice(0, 70)}`);
-    w.speech = { text, title, start: performance.now() / 1000 };
+    // The bubble shows "..." until the voice starts, then keeps pace with it.
+    const speech = { text, title, start: Infinity, rate: CHARS_PER_SECOND };
+    w.speech = speech;
+    this.lastSaid = { text, until: Infinity };
     const mouth = w.rig.root.getWorldPosition(new Vector3()).setY(1.1);
     blip(mouth);
     w.mood = 'talking';
-    return speak(text, this.hash(w.name), mouth).then(() => {
+    const onStart = (rate: number) => {
+      speech.start = performance.now() / 1000;
+      speech.rate = Math.min(30, Math.max(8, rate));
+    };
+    return speak(text, this.hash(w.name), mouth, onStart).then(() => {
       if (w.speechToken !== token) return;
       w.mood = 'idle';
+      // The microphone can still hear the tail of this line for a moment.
+      this.lastSaid = { text, until: performance.now() / 1000 + 2.5 };
       // Leave the whole line up after speaking.
       if (w.speech) w.bubble.setText(w.speech.text, w.speech.title);
       w.speech = null;
@@ -705,6 +791,9 @@ export class RoomSystem extends createSystem({
     const spot = new Vector3(Math.sin(angle) * 2.0, 0, -Math.cos(angle) * 2.0);
     w.scripted = true;
     w.item.visible = false;
+    // A colleague sent for from next door comes in through the pipe from there.
+    const door = handoff ? this.portals.find((d) => d.nodeId === handoff.fromRoomId) : undefined;
+    if (door) p.copy(door.landing);
     w.queue = [
       { kind: 'walk', to: spot },
       { kind: 'face', at: new Vector3(0, 0, 0) },
@@ -939,7 +1028,7 @@ export class RoomSystem extends createSystem({
 
     // React straight away and look busy while the model works.
     stopSpeaking();
-    const ack = this.say(w, thinkingLine(this.theme.id), this.titleFor(w)).then(() => {
+    const ack = this.say(w, thinkingLine(this.theme.id, question), this.titleFor(w)).then(() => {
       if (this.waiting && this.talking === w) w.mood = 'thinking';
     });
     const reply = await ask(app.mapId, app.graph, nodeId, persona, question, this.history);
@@ -975,8 +1064,11 @@ export class RoomSystem extends createSystem({
     if (file?.type === 'show_file') this.showFileCard(file.path);
 
     const answer = reply.answer || 'Right this way.';
+    const cuts = this.cutIns;
     await this.say(w, answer, this.titleFor(w, reply.offline ? ' (offline)' : ''));
     if (talk !== this.conversation) return;
+    // Cut off mid-answer: the visitor has moved on, so do not act on it.
+    if (this.cutIns !== cuts) return;
 
     // Actions that leave the room happen once the worker has finished talking.
     const leave = reply.actions.find(leavesRoom);
@@ -986,7 +1078,20 @@ export class RoomSystem extends createSystem({
       if (talk !== this.conversation) return;
     }
     if (leave?.type === 'go_to_room') {
-      app.handoff = { toRoom: leave.roomId, fromWorker: w.name, fromRoom: app.graph.nodes.find((n) => n.id === nodeId)?.label ?? nodeId, question, answer };
+      // Hand over out loud: name the colleague who will pick up next door.
+      const colleague = this.colleagueIn(leave.roomId);
+      const there = app.graph.nodes.find((n) => n.id === leave.roomId)?.label ?? 'the next room';
+      w.rig.gesture('Wave');
+      await this.say(w, `I'll get ${colleague} in ${there} to take it from here.`, this.titleFor(w));
+      if (talk !== this.conversation) return;
+      app.handoff = {
+        toRoom: leave.roomId,
+        fromWorker: w.name,
+        fromRoom: app.graph.nodes.find((n) => n.id === nodeId)?.label ?? nodeId,
+        fromRoomId: nodeId,
+        question,
+        answer,
+      };
       this.endConversation();
       enterRoom(leave.roomId);
     } else if (leave?.type === 'play_flow') {
@@ -997,6 +1102,36 @@ export class RoomSystem extends createSystem({
       this.endConversation();
       leaveRoom();
     }
+  }
+
+  /**
+   * True when what the microphone heard is mostly the worker's own line:
+   * the headset speaker leaking into the mic, not the visitor.
+   */
+  private isEcho(heard: string): boolean {
+    const said = this.lastSaid;
+    if (!said || performance.now() / 1000 > said.until) return false;
+    const words = (s: string) => s.toLowerCase().match(/[a-z0-9']+/g) ?? [];
+    const spoken = new Set(words(said.text));
+    const got = words(heard).filter((x) => x.length > 2);
+    if (got.length === 0) return true;
+    const shared = got.filter((x) => spoken.has(x)).length;
+    return shared / got.length >= 0.6;
+  }
+
+  /** Stops the worker mid-line because the visitor started talking. */
+  private interrupt(w: WorkerState): void {
+    this.cutIns += 1;
+    w.speechToken += 1;
+    stopSpeaking();
+    if (w.speech) w.speech = null;
+    this.lastSaid = null;
+    w.mood = 'listening';
+  }
+
+  /** The worker who picks up a handoff in a room: the second one there (see build). */
+  private colleagueIn(roomId: string): string {
+    return NAMES[(this.hash(roomId) + 1) % NAMES.length];
   }
 
   /** The first neighbouring room named in a reply, if any. */
@@ -1177,7 +1312,16 @@ export class RoomSystem extends createSystem({
       read,
       { kind: 'call', fn: () => this.hush(lead) },
     );
-    if (outPortal) {
+    if (outPortal && next) {
+      // The visitor carries it on: the lead holds it out, and does it
+      // itself if nobody takes it (see offerPacket and updateOffer).
+      tasks.push(
+        { kind: 'walk', to: OFFER_SPOT },
+        { kind: 'face', at: new Vector3(0, 0, 0) },
+        { kind: 'call', fn: () => this.offerPacket(lead, outPortal, next) },
+        { kind: 'until', test: () => this.offer === null },
+      );
+    } else if (outPortal) {
       tasks.push(
         { kind: 'walk', to: outPortal.landing },
         { kind: 'face', at: outPortal.mouth },
@@ -1205,6 +1349,110 @@ export class RoomSystem extends createSystem({
     }
     tasks.push({ kind: 'call', fn: () => (lead.scripted = false) });
     lead.queue = tasks;
+  }
+
+  // ------------------------------------------------------ carrying the request
+
+  /** The lead holds the request out: pinch it, then pinch the pipe it goes down next. */
+  private offerPacket(lead: WorkerState, portal: Portal, next: string): void {
+    this.offer = { lead, portal, next, deadline: Infinity, carrying: false, sending: false };
+    const offer = this.offer;
+    if (this.catcher && !this.catcher.hasComponent(RayInteractable)) this.catcher.addComponent(RayInteractable);
+    const where = app.graph.nodes.find((n) => n.id === next)?.label ?? 'next';
+    const line = this.taughtCarry
+      ? `Your turn. Send it on to ${where}.`
+      : `Here, you take it. Pinch the request, then pinch the ${where} pipe.`;
+    this.taughtCarry = true;
+    lead.rig.gesture('Yes');
+    const title = `${lead.name} | ${this.theme?.role ?? ''}`;
+    // The wait starts once the visitor has heard what to do.
+    const startClock = () => {
+      if (offer.deadline === Infinity) offer.deadline = performance.now() / 1000 + OFFER_SECONDS;
+    };
+    if (this.talking) {
+      lead.bubble.setText(line, title);
+      startClock();
+    } else void this.say(lead, line, title).then(startClock);
+  }
+
+  /** The visitor pinched the request: it leaves the lead's hands and floats with them. */
+  private takePacket(): void {
+    const offer = this.offer;
+    const packet = this.packet;
+    if (!offer || offer.carrying || offer.sending || !packet || !this.roomGroup) return;
+    offer.carrying = true;
+    offer.deadline = performance.now() / 1000 + OFFER_SECONDS * 2;
+    if (this.catcher?.hasComponent(RayInteractable)) this.catcher.removeComponent(RayInteractable);
+    packet.held = false;
+    this.roomGroup.attach(packet.group);
+    click();
+    const where = app.graph.nodes.find((n) => n.id === offer.next)?.label ?? 'next';
+    offer.lead.bubble.setText(`Now pinch the ${where} pipe.`, `${offer.lead.name} | ${this.theme?.role ?? ''}`);
+  }
+
+  /** The visitor pinched a pipe while carrying the request. */
+  private sendPacketTo(nodeId: string): void {
+    const offer = this.offer;
+    if (!offer?.carrying || offer.sending) return;
+    const title = `${offer.lead.name} | ${this.theme?.role ?? ''}`;
+    if (nodeId !== offer.next) {
+      const wrong = app.graph.nodes.find((n) => n.id === nodeId)?.label ?? 'somewhere else';
+      const right = app.graph.nodes.find((n) => n.id === offer.next)?.label ?? 'the next part';
+      offer.lead.rig.gesture('No');
+      void this.say(offer.lead, `Not that one, that goes to ${wrong}. This needs to go to ${right}.`, title);
+      return;
+    }
+    offer.lead.rig.gesture('ThumbsUp');
+    offer.lead.bubble.setText('Nice. Off it goes.', title);
+    this.launchPacket(offer);
+  }
+
+  /** Sends the request down the offer's pipe, from wherever it is now. */
+  private launchPacket(offer: Offer): void {
+    const packet = this.packet;
+    if (!packet || !this.roomGroup) return;
+    offer.sending = true;
+    if (this.catcher?.hasComponent(RayInteractable)) this.catcher.removeComponent(RayInteractable);
+    packet.label.setText(this.callLabel(this.builtNode, offer.next) ?? '');
+    if (packet.group.parent !== this.roomGroup) this.roomGroup.attach(packet.group);
+    const from = packet.group.position.clone();
+    this.fly(from, offer.portal.mouth, 1.1, () => {
+      packet.group.visible = false;
+      if (this.offer === offer) this.offer = null;
+      this.packetLeft();
+    });
+  }
+
+  private endOffer(): void {
+    if (this.catcher?.hasComponent(RayInteractable)) this.catcher.removeComponent(RayInteractable);
+    this.offer = null;
+  }
+
+  /** Each frame: keep the catch area on the request, float a carried one before the visitor, or time out. */
+  private updateOffer(): void {
+    const offer = this.offer;
+    const packet = this.packet;
+    if (!offer || !packet || !this.roomGroup || offer.sending) return;
+    if (!offer.carrying) {
+      packet.group.getWorldPosition(this.tmp);
+      this.roomGroup.worldToLocal(this.tmp);
+      this.catcher?.object3D?.position.copy(this.tmp);
+    } else {
+      // In front of the visitor, a little low, as if held.
+      this.tmp2.copy(this.headForward);
+      this.tmp2.y = 0;
+      if (this.tmp2.lengthSq() < 1e-4) this.tmp2.set(0, 0, -1);
+      this.tmp2.normalize();
+      this.tmp.copy(this.head).addScaledVector(this.tmp2, 0.5);
+      this.tmp.y -= 0.18;
+      this.roomGroup.worldToLocal(this.tmp);
+      packet.group.position.lerp(this.tmp, 0.25);
+    }
+    if (performance.now() / 1000 > offer.deadline) {
+      // Nobody took it, or it was never sent: the lead does it.
+      if (!offer.carrying) offer.lead.rig.gesture('Throw');
+      this.launchPacket(offer);
+    }
   }
 
   /** The request text on the link between two parts, e.g. "POST /checkout". */
@@ -1281,12 +1529,11 @@ export class RoomSystem extends createSystem({
 
     for (const w of this.workers) this.updateWorker(w, delta);
     this.separateWorkers();
+    this.updateOffer();
 
-    // Half-duplex: the mic is muted while the worker talks or thinks, so it
-    // never hears the worker's own voice as a question.
-    if (this.talking && this.mic) {
-      this.mic.muted = this.waiting || this.talking.mood === 'talking' || this.talking.mood === 'thinking';
-    }
+    // The mic stays open while the worker talks, so the visitor can cut in
+    // (see isEcho); it is only closed while the answer is being worked out.
+    if (this.talking && this.mic) this.mic.muted = this.waiting;
 
     const packet = this.packet;
     if (packet?.flying) {
@@ -1413,7 +1660,7 @@ export class RoomSystem extends createSystem({
     // The bubble types the current line out at talking pace, a word at a time.
     if (w.speech) {
       const text = w.speech.text;
-      let cut = Math.floor((performance.now() / 1000 - w.speech.start) * CHARS_PER_SECOND);
+      let cut = Math.floor((performance.now() / 1000 - w.speech.start) * w.speech.rate);
       if (cut < text.length) {
         const space = text.lastIndexOf(' ', cut);
         cut = space > 0 ? space : 0;

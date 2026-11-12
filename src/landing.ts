@@ -1,4 +1,4 @@
-import { VisibilityState, type World } from '@iwsdk/core';
+import { SessionMode, VisibilityState, type World } from '@iwsdk/core';
 import { canRecord } from './agent/recorder.js';
 import { unlock } from './audio/sound.js';
 
@@ -28,6 +28,7 @@ export function landingFailed(): void {
 export async function landingReady(world: World): Promise<void> {
   const root = el('landing');
   const enter = el<HTMLButtonElement>('enter-vr');
+  const mixed = el<HTMLButtonElement>('enter-mr');
   const mic = el<HTMLButtonElement>('allow-mic');
   const note = el('landing-note');
   if (!root || !enter || !mic || !note) return;
@@ -47,11 +48,26 @@ export async function landingReady(world: World): Promise<void> {
       world.launchXR();
     });
     void offerMicrophone(mic, note);
+    // Mixed reality: the city on the visitor's own desk, in their own room.
+    let passthrough = false;
+    try {
+      passthrough = (await navigator.xr?.isSessionSupported('immersive-ar')) ?? false;
+    } catch {
+      // No passthrough here; VR only.
+    }
+    if (passthrough && mixed) {
+      mixed.hidden = false;
+      mixed.addEventListener('click', () => {
+        unlock();
+        world.launchXR({ sessionMode: SessionMode.ImmersiveAR });
+      });
+    }
   } else {
     // A phone or a desktop browser: say where the real thing is, then get out of the way.
     note.textContent =
       'This is a VR app. Open this page in the browser on a Meta Quest headset to step inside. ' +
-      'Here you can preview it with a mouse: click a building, then press Step inside.';
+      'Here you can preview it with a mouse: click a building, then press Step inside. ' +
+      'WASD moves you, and the arrow keys or a right-mouse drag look around.';
     enter.textContent = 'Preview here';
     enter.hidden = false;
     enter.addEventListener('click', () => {

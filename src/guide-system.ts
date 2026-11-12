@@ -39,7 +39,7 @@ import { dive } from './transition.js';
  * starts it over.
  */
 
-type Target = 'building' | 'worker' | null;
+type Target = 'building' | 'worker' | 'handle' | null;
 
 interface Step {
   title: string;
@@ -60,6 +60,13 @@ const STEPS: Step[] = [
     done: (clock) => clock > 6 || app.selected !== null || app.mode === 'room',
     target: null,
     pinch: false,
+  },
+  {
+    title: 'Get comfortable',
+    text: () => 'Too close or too far? Pinch the grey bar below the buttons and drag it where you like.',
+    done: (clock) => guideProgress.moved || clock > 14 || app.selected !== null || app.mode === 'room',
+    target: 'handle',
+    pinch: true,
   },
   {
     title: 'Point and pinch',
@@ -110,7 +117,7 @@ const STEPS: Step[] = [
   },
   {
     title: 'You are set',
-    text: () => 'Pinch Play flow to watch a request travel through the code. Have fun exploring!',
+    text: () => 'Pinch Play flow to watch a request travel through the code, or ask a robot to quiz you. Have fun!',
     done: (clock) => clock > 7,
     target: null,
     pinch: false,
@@ -132,10 +139,11 @@ const ACCENT = '#7ee0ff';
 const CARD_ANCHOR = new Vector3(0, 0.3, -0.24);
 /**
  * Inside a room the city is gone and a robot stands straight ahead to talk,
- * so the card drops to the empty desk top, just behind the buttons, where it
- * covers neither the robot nor its speech bubble.
+ * so the card shrinks and sits low, just behind the buttons, well below the
+ * line from the eyes to the robot and its speech bubble.
  */
-const ROOM_ANCHOR = new Vector3(0, 0.085, 0.05);
+const ROOM_ANCHOR = new Vector3(0, 0.045, 0.16);
+const ROOM_SCALE = 0.6;
 const CARD_WIDTH = 0.46;
 const PINCH_SECONDS = 1.6;
 
@@ -160,6 +168,7 @@ export class GuideSystem extends createSystem({
   private suggested: Object3D | null = null;
   private workers: Object3D[] = [];
   private workerScan = 0;
+  private handle: Object3D | null = null;
 
   private head = new Vector3();
   private point = new Vector3();
@@ -285,6 +294,7 @@ export class GuideSystem extends createSystem({
     if (workspace && !hidden) {
       this.holder.position.copy(app.mode === 'room' ? ROOM_ANCHOR : CARD_ANCHOR);
       workspace.localToWorld(this.holder.position);
+      this.holder.scale.setScalar(app.mode === 'room' ? ROOM_SCALE : 1);
       this.holder.lookAt(this.head);
     }
 
@@ -312,6 +322,13 @@ export class GuideSystem extends createSystem({
         this.box.getCenter(this.point);
         this.point.y = this.box.max.y + 0.03;
         size = 0.018;
+      }
+    } else if (!hidden && target === 'handle' && app.mode === 'table') {
+      this.handle ??= this.world.scene.getObjectByName('desk-handle') ?? null;
+      if (this.handle?.visible) {
+        this.handle.getWorldPosition(this.point);
+        this.point.y += 0.045;
+        size = 0.016;
       }
     } else if (!hidden && target === 'worker' && app.mode === 'room') {
       this.workerScan -= delta;

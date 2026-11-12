@@ -15,23 +15,46 @@ import { GuideSystem } from './guide-system.js';
 import { landingFailed, landingReady } from './landing.js';
 import { restartGuide } from './guide.js';
 import { WorkspaceSystem } from './workspace.js';
+import { DesktopControlsSystem } from './desktop-controls.js';
+
+// Eye tracking is only for Meta VR Glasses (open with ?gaze). Asking for it
+// crashes the Quest 2 browser at page load, and Quest has no eye tracking.
+// ?nooffer stops the browser's own Enter VR prompt (for troubleshooting).
+const params = new URLSearchParams(location.search);
+const options = { ...projectOptions } as typeof projectOptions;
+if (options.xr) {
+  const xr = { ...options.xr, features: { ...options.xr.features } };
+  if (!params.has('gaze')) delete (xr.features as Record<string, unknown>).gazeTracking;
+  if (params.has('nooffer')) xr.offer = 'none';
+  options.xr = xr;
+}
 
 World.create(
   document.getElementById('scene-container') as HTMLDivElement,
-  projectOptions,
+  options,
 ).then((world) => {
   world.registerSystem(WorkspaceSystem);
   world.registerSystem(DioramaSystem);
   world.registerSystem(RoomSystem);
   world.registerSystem(GuideSystem);
   world.registerSystem(AtmosphereSystem);
+  world.registerSystem(DesktopControlsSystem);
 
   // A link straight to one map (the Claude skill prints one) skips the menu.
   const wanted = new URLSearchParams(location.search).get('map');
   if (wanted && MAPS[wanted]) chooseDemo(wanted);
 
+  // A Quest 2 has about a third of a Quest 3's graphics power: draw slightly
+  // fewer pixels there so turning the head stays smooth.
+  if (/Quest 2/.test(navigator.userAgent)) world.renderer.xr.setFramebufferScaleFactor(0.85);
+
   // Browsers allow audio only after a gesture: the first press, or entering VR.
   window.addEventListener('pointerdown', unlock);
+  // A pinch in VR counts as a gesture too. This matters when the visitor
+  // entered through the browser's own Enter VR prompt, not the page button.
+  world.renderer.xr.addEventListener('sessionstart', () => {
+    world.renderer.xr.getSession()?.addEventListener('selectstart', unlock);
+  });
 
   // Pause cleanly. In VR that is the headset coming off or the system menu
   // opening over the app; outside VR it is the browser tab going to the
@@ -63,7 +86,7 @@ World.create(
         app.graph.nodes.map((n) => `${n.label} -> ${pickTheme(app.graph, n.id).place}`).join(' | '),
     );
     window.addEventListener('keydown', (e) => {
-      if (e.key === 'i') enterRoom(app.selected ?? 'api.payments');
+      if (e.key === 'i') enterRoom(app.flowSteps[app.stepIndex]?.nodeId ?? app.selected ?? 'api.payments');
       if (e.key === 't') leaveRoom();
       if (e.key === 'p') startFlow();
       if (e.key === 'n') nextStep();
@@ -80,6 +103,8 @@ World.create(
       const digit = Number(e.key);
       if (digit >= 1 && digit <= 9) enterRoom(rooms[digit - 1]);
       if (e.key === 'm') cycleMap();
+      // 0: close the start menu on the current map (emulator presses can be too slow to click).
+      if (e.key === '0') chooseDemo(app.mapId);
       if (e.key === 'u') restartGuide();
       // z: pretend the headset came off (and again: back on).
       if (e.key === 'z') setPaused(!isPaused());
