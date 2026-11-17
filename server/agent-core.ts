@@ -15,6 +15,7 @@ import {
 import { gradingPrompt, parseVerdict, quizFor } from '../src/agent/quiz.js';
 import { MAPS } from '../src/maps/index.js';
 import { MAX_NOTE, MAX_SAID, NOTES_IN_PROMPT, parseScribe, scribePrompt, type ScribeReply } from '../src/notes/scribe.js';
+import { ACTION_LINES, activeBrain } from './brain.js';
 import { createLimiter } from './rate-limit.js';
 
 /**
@@ -62,6 +63,19 @@ export interface AgentReply {
   actions: AgentAction[];
   /** Only when marking a quiz answer: whether the visitor had it right. */
   right?: boolean;
+}
+
+/**
+ * Who answers, besides Meta's Model API (development server only; see
+ * server/brain.ts): ROBOT_BRAIN=claude uses the user's signed-in Claude Code,
+ * and CHAT_API_BASE (+ CHAT_API_KEY, CHAT_MODEL) any OpenAI-compatible chat
+ * completions endpoint, such as a local Ollama at http://localhost:11434/v1.
+ */
+const chatBase = () => process.env.CHAT_API_BASE?.trim().replace(/\/+$/, '') || '';
+
+/** A key is only needed when Meta's Model API is the one answering. */
+function needsKey(apiKey: string | undefined): asserts apiKey is string {
+  if (!apiKey && !activeBrain() && !chatBase()) throw new AgentError(503, 'MODEL_API_KEY is not set on the server');
 }
 
 export class AgentError extends Error {
@@ -120,7 +134,7 @@ export function validate(body: unknown): AgentRequest {
 
 /** Marks an answer the visitor gave to a quiz question in their own words. */
 export async function markAnswer(req: AgentRequest, apiKey: string | undefined, model = DEFAULT_MODEL): Promise<AgentReply> {
-  if (!apiKey) throw new AgentError(503, 'MODEL_API_KEY is not set on the server');
+  needsKey(apiKey);
   const graph = MAPS[req.mapId];
   const question = quizFor(graph, req.nodeId).find((q) => q.id === req.quiz);
   if (!question) throw new AgentError(404, 'Unknown quiz question');
@@ -181,7 +195,7 @@ export function validateScribe(body: unknown): ScribeRequest {
 
 /** Talks one idea over and returns what to say and what to write down. */
 export async function talkOver(req: ScribeRequest, apiKey: string | undefined, model = DEFAULT_MODEL): Promise<ScribeReply> {
-  if (!apiKey) throw new AgentError(503, 'MODEL_API_KEY is not set on the server');
+  needsKey(apiKey);
   const reply = await complete(
     [{ role: 'system', content: scribePrompt(MAPS[req.mapId], req.persona, req.notes) }, ...req.history, { role: 'user', content: req.said }],
     apiKey,
@@ -195,7 +209,7 @@ export async function talkOver(req: ScribeRequest, apiKey: string | undefined, m
 }
 
 export async function askAgent(req: AgentRequest, apiKey: string | undefined, model = DEFAULT_MODEL): Promise<AgentReply> {
-  if (!apiKey) throw new AgentError(503, 'MODEL_API_KEY is not set on the server');
+  needsKey(apiKey);
   const graph = MAPS[req.mapId];
   const messages = [
     { role: 'system', content: systemPrompt(graph, req.nodeId, req.persona) },
@@ -212,7 +226,8 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
   // and stops, waiting to hear how the tool went before it carries on. Or it
   // answers with a single throwaway line. Give it one more turn to finish.
   const left = UPSTREAM_TIMEOUT_MS - (Date.now() - started);
-  if (!actions.some(leavesRoom) && parseReply(text).answer.length < THIN_ANSWER && left > MIN_SECOND_TRY_MS) {
+  // (Not for a command-line brain: it gives full answers, and a second reply would not fit in the time.)
+  if (!activeBrain() && !actions.some(leavesRoom) && parseReply(text).answer.length < THIN_ANSWER && left > MIN_SECOND_TRY_MS) {
     try {
       if (first.raw.tool_calls?.length) {
         const more = await complete(
@@ -299,19 +314,31 @@ async function complete(
   timeoutMs: number,
   withTools = true,
 ): Promise<{ text: string; calls: { name: string; args: Record<string, unknown> }[]; raw: RawMessage }> {
-  const response = await fetch(`${MODEL_API_BASE}/chat/completions`, {
+  const brain = activeBrain();
+  if (brain) {
+    // A command line has no function calls: it writes each action as a line
+    // of its own, which extractLeakedCalls already reads.
+    const turns = messages as { role: string; content: string }[];
+    const system = turns.filter((t) => t.role === 'system').map((t) => t.content).join('\n\n');
+    const instructions = withTools ? system.replace('Never write tool calls as text.', ACTION_LINES) : system;
+    const said = await brain.reply(instructions, turns.filter((t) => t.role !== 'system'), timeoutMs);
+    const leaked = extractLeakedCalls(said.replace(/^[ \t]*`+|`+[ \t]*$/gm, ''));
+    return { text: leaked.text, calls: leaked.calls, raw: { content: said } };
+  }
+  const other = chatBase();
+  const response = await fetch(`${other || MODEL_API_BASE}/chat/completions`, {
     method: 'POST',
     // The headset stops waiting after 15 seconds; do not keep paying after that.
     signal: AbortSignal.timeout(timeoutMs),
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${other ? (process.env.CHAT_API_KEY ?? '') : apiKey}` },
     // Muse models reason by default; minimal keeps replies to a few seconds.
     // Reasoning tokens count against max_tokens, and a reply that runs out
     // mid-thought drops its tool calls, so leave plenty of room.
     body: JSON.stringify({
-      model,
+      model: other ? (process.env.CHAT_MODEL ?? model) : model,
       messages,
       max_tokens: 1400,
-      reasoning_effort: 'minimal',
+      ...(other ? {} : { reasoning_effort: 'minimal' }),
       ...(withTools ? { tools: AGENT_TOOLS, tool_choice: 'auto' } : {}),
     }),
   });
@@ -392,7 +419,7 @@ export async function handleAgent(
     const scribe = !!body && typeof body === 'object' && (body as Record<string, unknown>).scribe === true;
     const idea = scribe ? validateScribe(body) : null;
     const req = idea ? null : validate(body);
-    if (apiKey && !(perMinute.allow(address) && perHour.allow(address) && everyone.allow('all'))) {
+    if ((apiKey || activeBrain() || chatBase()) && !(perMinute.allow(address) && perHour.allow(address) && everyone.allow('all'))) {
       throw new AgentError(429, 'Too many questions; try again in a minute');
     }
     if (idea) return { status: 200, json: await talkOver(idea, apiKey, model || undefined) };

@@ -37,6 +37,10 @@ function agentApi(): Plugin {
     },
     configureServer(server) {
       const env = loadEnv('development', process.cwd(), '');
+      // Who answers for the robots when it is not Meta's Model API (server/brain.ts, server/agent-core.ts).
+      for (const name of ['ROBOT_BRAIN', 'ROBOT_BRAIN_MODEL', 'CHAT_API_BASE', 'CHAT_API_KEY', 'CHAT_MODEL']) {
+        if (env[name] && !process.env[name]) process.env[name] = env[name];
+      }
 
       // Live speech recognition: relay WebSocket upgrades on /api/asr.
       const asrSockets = new WebSocketServer({ noServer: true });
