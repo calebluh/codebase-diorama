@@ -1,5 +1,5 @@
 import { resolveRef } from '../layout.js';
-import type { GraphData } from '../maps/types.js';
+import type { GraphData, HealthIssue } from '../maps/types.js';
 
 /**
  * What each room's worker knows, and how it talks. Pure (no DOM, no Three.js),
@@ -66,14 +66,66 @@ export function roomFacts(graph: GraphData, nodeId: string): string[] {
   return facts;
 }
 
+/** Room facts plus code lines stay under this many characters, so prompts stay short. */
+const ROOM_FACTS_MAX = 7000;
+
+/**
+ * What the map read from the room's code itself (maps built by
+ * scripts/build-map.mjs): each file's top-level function and class names with
+ * their lines, and the lines around each of the room's warnings. Empty for
+ * maps without them. Warnings come first, so a long room loses function
+ * names, never the code the visitor is most likely to ask about.
+ */
+export function codeFacts(graph: GraphData, nodeId: string, budget: number): string[] {
+  const issues = (graph.health?.issues ?? []).filter((issue) => {
+    const loc = issue.locations?.[0];
+    return issue.excerpt && loc && resolveRef(graph, loc.file) === nodeId;
+  });
+  const warning = (issue: HealthIssue, radius: number) => {
+    const loc = issue.locations![0];
+    return `Code around the warning "${issue.title}" in ${loc.file}, flagged line ${loc.line ?? '?'} marked ">":\n${excerptWindow(issue.excerpt!, radius)}`;
+  };
+  // The warnings always go in; in a room that is already long, fewer lines around each.
+  let warnings = issues.map((i) => warning(i, Infinity));
+  if (warnings.join('\n').length > budget) warnings = issues.map((i) => warning(i, NARROW_EXCERPT));
+  const out = [...warnings];
+  let left = budget - warnings.join('\n').length;
+  const names = graph.files.filter((f) => f.n === nodeId && f.exports?.length).map((f) => `- ${f.p}: ${f.exports!.join(', ')}`);
+  const heading = 'Functions and classes in your files (name and first line):';
+  if (names.length && heading.length + names[0].length + 2 <= left) {
+    out.push(heading);
+    left -= heading.length + 1;
+    for (const n of names) {
+      if (n.length + 1 > left) break;
+      out.push(n);
+      left -= n.length + 1;
+    }
+  }
+  return out;
+}
+
+/** Lines either side of the flagged line kept when a room's facts are already long. */
+const NARROW_EXCERPT = 5;
+
+/** The lines of an excerpt within `radius` of its flagged (">") line. */
+function excerptWindow(excerpt: string, radius: number): string {
+  const lines = excerpt.split('\n');
+  const at = lines.findIndex((l) => l.startsWith('>'));
+  if (at < 0 || !Number.isFinite(radius)) return excerpt;
+  return lines.slice(Math.max(0, at - radius), at + radius + 1).join('\n');
+}
+
 export function systemPrompt(graph: GraphData, nodeId: string, persona: Persona): string {
   const node = graph.nodes.find((n) => n.id === nodeId);
+  const facts = roomFacts(graph, nodeId);
+  const code = codeFacts(graph, nodeId, ROOM_FACTS_MAX - facts.join('\n').length);
   return [
     `You are ${persona.name}, a ${persona.role} in the ${persona.place}. You are a worker in an imaginary building where every part of the "${graph.project.name}" codebase is a room, and the workers in each room personify that code. Your room is "${node?.label ?? nodeId}" (room id ${nodeId}).`,
     `The app as a whole: ${graph.project.summary}`,
     '',
     'Facts about your room (the only things you know for certain):',
-    ...roomFacts(graph, nodeId),
+    ...facts,
+    ...(code.length ? ['', 'From your code itself (only these lines; you have not read the rest of the code):', ...code] : []),
     '',
     'Building directory (room id = name):',
     ...graph.nodes.map((n) => `- ${n.id} = ${n.label}`),
@@ -84,12 +136,22 @@ export function systemPrompt(graph: GraphData, nodeId: string, persona: Persona)
     '- Speak in the first person as the worker, warm and plain-spoken, for someone who may not be a programmer. Use the building metaphor lightly, but name real files and requests when they help. Sound like a person talking, not a document: contractions, no lists, no markdown.',
     '- Keep it to 2-4 short sentences; your words appear in a speech bubble in VR and are read aloud.',
     '- You have already said hello and given your name and job. Do not do that again, and do not announce what you are about to say ("here is what I do", "I am on it"). Your first sentence is already the answer.',
-    '- Only use the facts above. If something is not covered, say you do not know and suggest which room to ask.',
+    '- Use only the facts above for what the code does. If something is not covered, say you do not know and suggest which room to ask.',
+    ...(code.length
+      ? [
+          '- You may name the functions, classes and line numbers listed under "From your code itself", and say what the lines around a warning do. Name the function and the line; never read code out. If asked about anything else in the code, say you have only seen those lines.',
+          '- When the visitor asks how to fix or improve something (a health warning above, or a problem they describe), say your best concrete suggestion in one or two short sentences: the line or function to change and what to change, reasoned from the facts and the code lines above. Say in a few words that it is a suggestion from those lines, since you have not read the rest of the code. Then call add_note with the full fix (naming the file and line), and tell them it is on their notes list for their coding agent. Keep the whole answer to 2-4 short sentences; the details belong in the note, not in your words.',
+          '- When you talk about your warning, also call show_file with its file, so the visitor can see the lines.',
+        ]
+      : [
+          '- When the visitor asks how to fix or improve something (a health warning above, or a problem they describe), give your best concrete suggestion: which of your files or which room to change, and what to change, reasoned from the facts. Say in a few words that it is a suggestion from the map, since you cannot see the code itself. Then call add_note with the fix, and tell them it is on their notes list for their coding agent.',
+        ]),
     '- You can act, using your tools, in the same reply as your words. Acting never replaces talking: still give your full 2-4 sentence spoken answer, then act. Never write tool calls as text.',
     '  - go_to_room when the visitor asks to go somewhere or to see another part, or agrees to your suggestion. Say you are sending them over.',
     '  - play_flow when they want to watch how something happens from start to finish.',
     '  - point_to_room when you mention a neighbouring room (never your own).',
     '  - show_file when you talk about one of your files in detail.',
+    '  - add_note when you suggest a fix or improvement, or the visitor asks you to remember something.',
     '  - back_to_city when the visitor wants to leave, step outside, or go back to the city, the table or the map. Say goodbye first.',
     '- After your answer, write exactly one more line: FOLLOWUPS: <question> | <question>',
     '  Those are two short questions (under 8 words) the visitor might ask you next.',
@@ -133,6 +195,18 @@ export const AGENT_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'add_note',
+      description: 'Write a line on the visitor’s notes list for this project: a fix or improvement to make, for their coding agent to pick up.',
+      parameters: {
+        type: 'object',
+        properties: { text: { type: 'string', description: 'One or two sentences: what to change, where, and why' } },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'back_to_city',
       description: 'Take the visitor out of the building, back to the little city on their desk.',
       parameters: { type: 'object', properties: {} },
@@ -146,6 +220,7 @@ export type AgentAction =
   | { type: 'play_flow'; flowId: string }
   | { type: 'point_to_room'; roomId: string }
   | { type: 'show_file'; path: string }
+  | { type: 'add_note'; text: string }
   | { type: 'back_to_city' };
 
 /** An action that ends the conversation because the visitor goes elsewhere. */
@@ -166,12 +241,25 @@ const LEAVE_PATTERNS = [
   /\bback to (the |my )?(city|desk|diorama)\b/i,
   // "go back to the table", as a request and not in the middle of a question
   /(^|[.,!?] ?)(please |ok(ay)?,? |thanks,? )*(go|head) back to (the |my )?(city|table|desk|map)\b/i,
-  // "I'd like to leave", "can we go back", "let's step out"
-  /\b(i'?d like to|i would like to|i want to|can i|can we|let'?s|let me|i'?ll|time to) (leave|exit|go back|head back|step out)\b/i,
+  // "can we go back to the table?": when nothing follows the place ("go back
+  // to the table of users" is about the code, and is not asking to leave)
+  /\b(can|could) (we|i|you) (go|head) back to (the |my )?(city|table|desk)( now| please)*\W*$/i,
+  // "I'd like to leave", "can we go back out", "let's step out": only when
+  // nothing follows but the place itself or a "now" or "please". "Can I leave
+  // a tip?", "let me go back a step" and "can we go back to what you said"
+  // are not asking to leave.
+  /\b(i'?d like to|i would like to|i want to|can i|can we|let'?s|let me|i'?ll|time to) (leave|exit|step out|go (back )?out(side)?|head (back )?out(side)?)( (this|the) (room|building|place))?( (now|here|please))*( |,)*([.!?]|$)/i,
   // "leave this room", as a request
   /(^|[.,!?] ?)(please |ok(ay)?,? |thanks,? )*(leave|exit) (this|the) (room|building)\b/i,
 ];
 export const asksToLeave = (question: string): boolean => LEAVE_PATTERNS.some((p) => p.test(question));
+
+/**
+ * The visitor asked to be taken somewhere or shown something, rather than
+ * asked a question: the robot answers "On it", not "Let me check the
+ * ledger". The same tests the server uses to act on such a request.
+ */
+export const asksToGo = (question: string): boolean => asksToLeave(question) || GO_PLAIN.test(question) || WATCH.test(question);
 
 /** Words that do not tell one room or flow from another. */
 const SMALL_WORDS = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'this', 'that', 'your', 'room']);
@@ -241,6 +329,9 @@ function promiseAt(answer: string): number {
   return -1;
 }
 
+/** The robot says it will play a flow: "I'll run the whole ...", "I'll walk you through ...". */
+const FLOW_PROMISE = /\b(?:I|we)(?:'|’)?ll (?:run|roll|play|start|walk|show you|take you through)\b/i;
+
 /** The one flow a lower-case question names, if any. */
 function flowNamed(graph: GraphData, question: string): string | null {
   const said = /\b(flow|play)\b/.test(question);
@@ -271,7 +362,17 @@ export function plainRequest(graph: GraphData, nodeId: string, question: string,
   if (asksToLeave(question)) return { type: 'back_to_city' };
   const q = question.toLowerCase();
   if (WATCH.test(q)) {
-    const flowId = flowNamed(graph, q);
+    // "Show me the whole simulation" names a flow only in part; a robot that
+    // answers "I'll walk you through the simulation run" names the rest.
+    let flowId = flowNamed(graph, q);
+    if (!flowId && (promiseAt(answer) >= 0 || FLOW_PROMISE.test(answer))) {
+      // Only a flow the question itself already began to name: "show me what
+      // you do here", answered "I'll walk you through it ... on billing day",
+      // is not a request to watch billing day.
+      const named = flowNamed(graph, `${q} ${answer.toLowerCase()}`);
+      const title = graph.flows.find((f) => f.id === named)?.title ?? '';
+      if (named && nameWords(title).some((w) => wordAt(q, w) >= 0)) flowId = named;
+    }
     if (flowId) return { type: 'play_flow', flowId };
   }
   const promise = promiseAt(answer);
@@ -331,6 +432,9 @@ export function validateActions(
     } else if (name === 'show_file') {
       const file = graph.files.find((f) => f.p === args.path && f.n === nodeId);
       if (file && !actions.some((a) => a.type === 'show_file')) actions.push({ type: 'show_file', path: file.p });
+    } else if (name === 'add_note') {
+      const text = typeof args.text === 'string' ? args.text.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+      if (text && !actions.some((a) => a.type === 'add_note')) actions.push({ type: 'add_note', text });
     } else if (name === 'back_to_city') {
       actions.push({ type: 'back_to_city' });
     }
@@ -338,6 +442,46 @@ export function validateActions(
   // Leaving the room or starting a flow ends the conversation; keep only the first.
   const leave = actions.findIndex(leavesRoom);
   return actions.filter((a, i) => (leavesRoom(a) ? i === leave : true));
+}
+
+/**
+ * The visitor plainly asked for a fix: "how would I fix the warning?", "fix
+ * this", "what's the fix?", "log a fix". Ordinary questions that only use the
+ * words ("what does Payments deal with?", "does this resolve the address?")
+ * are not, so they never put a note on the list.
+ */
+export const asksForFix = (question: string): boolean =>
+  /\bhow (do|would|can|should|could|might) (i|we|you) (go about )?(fix|solve|repair)(ing)?\b|\bhow to (fix|solve|repair)\b|\b(fix|solve|repair) (this|that|it|them)\b|\bfix the (warning|bug|problem|issue|error)s?\b|\bwhat(?:'|’)?s the fix\b|\bwhat is the fix\b|\b(log|add|note) (a|the) fix\b/i.test(
+    question,
+  );
+
+/** The health warning on one of this room's files, if it has one. */
+export function roomWarning(graph: GraphData, nodeId: string): HealthIssue | undefined {
+  return (graph.health?.issues ?? []).find((issue) => (issue.locations ?? []).some((loc) => resolveRef(graph, loc.file) === nodeId));
+}
+
+/** A fix note made from the room's warning alone, for when the model cannot be reached. */
+export function warningFixNote(issue: HealthIssue): string {
+  const loc = issue.locations?.[0];
+  const where = loc ? ` (${loc.file}${loc.line ? `:${loc.line}` : ''})` : '';
+  return `Fix: ${issue.title}${where}. Suggested from the map; check it against the code.`;
+}
+
+/** Sentences that are about the note or the map, not the fix itself. */
+const ABOUT_THE_NOTE = /suggestion from the map|can'?t see the code|cannot see the code|notes? list|coding agent|put (it|that) on|added (it|that)/i;
+
+/**
+ * The fix in a worker's answer, as a note: the sentences that say what to
+ * change, without the ones about the map or the notes list. Null when the
+ * answer holds no suggestion (it says it does not know, or is very short).
+ */
+export function fixNote(answer: string): string | null {
+  // Split only where a stop is followed by a space, so "simulation.py" stays whole.
+  const sentences = answer.split(/(?<=[.!?])\s+/);
+  const kept = sentences.map((s) => s.trim()).filter((s) => s && !ABOUT_THE_NOTE.test(s));
+  const text = kept.join(' ').replace(/\s+/g, ' ').trim();
+  if (text.length < 40 || /\b(i )?(do not|don'?t) know\b/i.test(text)) return null;
+  return text.length > 300 ? `${text.slice(0, 297).replace(/\s+\S*$/, '')}...` : text;
 }
 
 /** Starter questions for a room, before any conversation. */
@@ -348,7 +492,7 @@ export function suggestedQuestions(graph: GraphData, nodeId: string): string[] {
   const warned = (graph.health?.issues ?? []).some((i) =>
     (i.locations ?? []).some((loc) => resolveRef(graph, loc.file) === nodeId),
   );
-  questions.push(warned ? 'What is the warning about?' : 'What could go wrong here?');
+  questions.push(warned ? 'How would I fix the warning?' : 'What could go wrong here?');
   questions.push('Who do you work with?');
   return questions;
 }
@@ -358,7 +502,12 @@ export function parseReply(text: string): { answer: string; followups: string[] 
   const match = text.match(/^\s*FOLLOWUPS:\s*(.+)$/im);
   // Bubbles and speech are plain text: drop Markdown marks the model adds.
   const answer = (match ? text.slice(0, match.index) : text)
-    .replace(/[`*_#]/g, '')
+    .replace(/[`#]/g, '')
+    // **bold**, *italic* and _emphasis_ go, but code keeps its own marks:
+    // cleanup_old_tasks, __init__.py, origins "*".
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/(^|\s)\*([^*\s][^*\n]*?)\*(?=[\s.,!?;:]|$)/g, '$1$2')
+    .replace(/(^|\s)_{1,2}([^_\n]+?)_{1,2}(?=[\s.,!?;:]|$)/g, '$1$2')
     .replace(/\s+—\s+/g, ' - ')
     // Words said before and after a tool call arrive joined: "the building.I'm Eli".
     .replace(/([a-z][.!?])(?=[A-Z][a-z' ])/g, '$1 ')

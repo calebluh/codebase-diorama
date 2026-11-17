@@ -1,18 +1,22 @@
 import {
   Box3,
+  CanvasTexture,
   ConeGeometry,
   createSystem,
   DoubleSide,
-  Grabbed,
   Group,
   Mesh,
   MeshBasicMaterial,
   type Object3D,
+  PlaneGeometry,
+  PokeInteractable,
+  RayInteractable,
   RingGeometry,
   SphereGeometry,
-  TwoHandsGrabbable,
+  SRGBColorSpace,
   Vector3,
 } from '@iwsdk/core';
+import type { Entity } from '@iwsdk/core';
 import { blip } from './audio/sound.js';
 import { District } from './diorama-components.js';
 import { guideProgress } from './guide.js';
@@ -21,9 +25,10 @@ import type { GraphData } from './maps/types.js';
 import { ignoreRays } from './rays.js';
 import { Bubble } from './rooms/worker.js';
 import { app } from './state.js';
+import { NOTES_ROOM } from './notes/scribe.js';
 import { HACKATHON } from './edition.js';
 import { isPaused } from './pause.js';
-import { aimWord, placement } from './placement.js';
+import { aimWord, placement, pressWord } from './placement.js';
 import { dive } from './transition.js';
 
 /**
@@ -45,7 +50,7 @@ interface Step {
   title: string;
   text: (project: string) => string;
   /** True once the visitor has done this step (or something past it). */
-  done: (clock: number, grabbed: boolean) => boolean;
+  done: (clock: number) => boolean;
   target: Target;
   /** Show the animated pinch beside the card. */
   pinch: boolean;
@@ -62,13 +67,6 @@ const STEPS: Step[] = [
     pinch: false,
   },
   {
-    title: 'Get comfortable',
-    text: () => 'Too close or too far? Pinch the grey bar below the buttons and drag it where you like.',
-    done: (clock) => guideProgress.moved || clock > 14 || app.selected !== null || app.mode === 'room',
-    target: 'handle',
-    pinch: true,
-  },
-  {
     title: 'Point and pinch',
     text: () => `${aimWord()} the building with the arrow, then tap your thumb and finger together.`,
     done: () => app.selected !== null || app.mode === 'room' || guideProgress.talked,
@@ -77,10 +75,13 @@ const STEPS: Step[] = [
   },
   {
     title: 'Step inside',
-    text: () => 'Pinch Step inside, on the panel in front of you, to visit its room.',
+    text: () =>
+      placement.gaze
+        ? 'The roof lifts: that is its team. Pinch Step inside, over the building, to visit them.'
+        : 'The roof lifts: that is its team. Tap Step inside on the desk with a fingertip to visit them.',
     done: () => app.mode === 'room' || guideProgress.asked,
     target: null,
-    pinch: true,
+    pinch: false,
   },
   {
     title: 'Meet the team',
@@ -92,7 +93,7 @@ const STEPS: Step[] = [
   },
   {
     title: 'Ask anything',
-    text: () => 'Pinch a question on the left, or just say yours out loud.',
+    text: () => `Just say your question out loud, or ${pressWord().toLowerCase()} Questions on the left for ideas.`,
     done: () => guideProgress.asked,
     target: null,
     pinch: false,
@@ -100,9 +101,21 @@ const STEPS: Step[] = [
   },
   {
     title: 'Back to the city',
-    text: () => 'Pinch Back to table, or just ask a robot to take you back to the city.',
+    text: () => `${pressWord()} Back to table, or just ask a robot to take you back to the city.`,
     done: () => app.mode === 'table',
     target: null,
+    pinch: false,
+  },
+  {
+    title: 'Get comfortable',
+    text: () =>
+      placement.onTable
+        ? 'The city is standing on your own table. Pinch the grey bar below the buttons to slide it where you like.'
+        : placement.mixed
+          ? 'Pinch the grey bar below the buttons and set the city down on your own desk.'
+          : 'Too close or too far? Pinch the grey bar below the buttons and drag it where you like.',
+    done: (clock) => guideProgress.moved || clock > 14 || app.mode === 'room',
+    target: 'handle',
     pinch: true,
   },
   {
@@ -110,14 +123,14 @@ const STEPS: Step[] = [
     text: () =>
       placement.gaze
         ? 'Every building, button and robot works the same way: look at it and pinch.'
-        : 'Pinch the board with both hands, then pull apart to resize it or twist to turn it.',
-    done: (clock, grabbed) => grabbed || clock > 15,
+        : 'Pinch and hold a glowing corner peg to turn the city. Hold two at once and pull your hands apart to resize it.',
+    done: (clock) => guideProgress.turned || clock > 15,
     target: null,
     pinch: true,
   },
   {
     title: 'You are set',
-    text: () => 'Pinch Play flow to watch a request travel through the code, or ask a robot to quiz you. Have fun!',
+    text: () => `${pressWord()} Street view to walk the city, Play flow to follow a request, or Notes for ideas.`,
     done: (clock) => clock > 7,
     target: null,
     pinch: false,
@@ -146,19 +159,54 @@ const ROOM_ANCHOR = new Vector3(0, 0.045, 0.16);
 const ROOM_SCALE = 0.6;
 const CARD_WIDTH = 0.46;
 const PINCH_SECONDS = 1.6;
+/** The Skip tour button under the card's right corner, in metres. */
+const SKIP_WIDTH = 0.1;
+const SKIP_HEIGHT = 0.032;
+
+/** A small dark pill reading "Skip tour". */
+function makeSkipButton(): Mesh {
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = Math.round((320 * SKIP_HEIGHT) / SKIP_WIDTH);
+  const ctx = canvas.getContext('2d')!;
+  const h = canvas.height;
+  ctx.fillStyle = 'rgba(13, 17, 23, 0.92)';
+  ctx.beginPath();
+  ctx.roundRect(3, 3, canvas.width - 6, h - 6, (h - 6) / 2);
+  ctx.fill();
+  ctx.strokeStyle = ACCENT;
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ctx.font = '600 44px Inter, "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#f0f3f6';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Skip tour', canvas.width / 2, h / 2 + 2);
+  const texture = new CanvasTexture(canvas);
+  texture.colorSpace = SRGBColorSpace;
+  const mesh = new Mesh(new PlaneGeometry(SKIP_WIDTH, SKIP_HEIGHT), new MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false }));
+  mesh.name = 'guide-skip';
+  mesh.renderOrder = 21;
+  return mesh;
+}
 
 export class GuideSystem extends createSystem({
   sites: { required: [District] },
-  grabbedBoard: { required: [TwoHandsGrabbable, Grabbed] },
 }) {
   private holder = new Group();
-  private card = new Bubble(CARD_WIDTH, ACCENT, 3);
+  private card = new Bubble(CARD_WIDTH, ACCENT, 5);
   private pinch = new Group();
   private thumb!: Mesh;
   private finger!: Mesh;
   private ring!: Mesh;
   private ringMaterial!: MeshBasicMaterial;
   private arrow!: Mesh;
+  private skip = makeSkipButton();
+  private skipEntity: Entity | null = null;
+  private skipHit = false;
+  /** Each fingertip's last depth in front of Skip tour (Infinity: not over it). */
+  private skipTipZ = { left: Infinity, right: Infinity };
+  private tip = new Vector3();
 
   private active = false;
   private index = -1;
@@ -195,7 +243,12 @@ export class GuideSystem extends createSystem({
     ignoreRays(this.holder);
     ignoreRays(this.arrow);
     this.holder.visible = false;
-    this.world.createTransformEntity(this.holder, { persistent: true });
+    const holderEntity = this.world.createTransformEntity(this.holder, { persistent: true });
+    // Skip tour: pinch it from afar or tap it with a fingertip.
+    this.skipEntity = this.world.createTransformEntity(this.skip, { parent: holderEntity, persistent: true });
+    (this.skip as unknown as { addEventListener(type: string, fn: () => void): void }).addEventListener('pointerdown', () => {
+      this.skipHit = true;
+    });
     this.world.createTransformEntity(this.arrow, { persistent: true });
 
     const wanted = new URLSearchParams(location.search).get('guide');
@@ -215,6 +268,8 @@ export class GuideSystem extends createSystem({
     this.active = false;
     this.holder.visible = false;
     this.arrow.visible = false;
+    this.skipTipZ.left = this.skipTipZ.right = Infinity;
+    this.setSkipPressable(false);
     try {
       localStorage.setItem(STORAGE_KEY, 'done');
     } catch {
@@ -251,9 +306,19 @@ export class GuideSystem extends createSystem({
       this.shown = null;
     }
     if (!this.active) return;
+    if (this.skipHit) {
+      this.skipHit = false;
+      if (this.holder.visible) {
+        if (import.meta.env.DEV) console.log('[guide] skipped');
+        blip();
+        this.finish();
+        return;
+      }
+    }
     if (app.menu) {
       this.holder.visible = false;
       this.arrow.visible = false;
+      this.setSkipPressable(false);
       return;
     }
     if (this.graph !== app.graph) {
@@ -263,9 +328,8 @@ export class GuideSystem extends createSystem({
 
     // Advance past every step already done; each change restarts the clock.
     this.clock += delta;
-    const grabbed = this.queries.grabbedBoard.entities.size > 0;
     let next = Math.max(this.index, 0);
-    while (next < STEPS.length && STEPS[next].done(next === this.index ? this.clock : 0, grabbed)) next += 1;
+    while (next < STEPS.length && STEPS[next].done(next === this.index ? this.clock : 0)) next += 1;
     if (next >= STEPS.length) {
       this.finish();
       return;
@@ -280,6 +344,8 @@ export class GuideSystem extends createSystem({
     if (step !== this.shown) {
       this.shown = step;
       this.card.setText(step.text(app.graph.project.name), `${this.index + 1} of ${STEPS.length}  ${step.title}`);
+      // Under the card's right corner, clear of its text.
+      this.skip.position.set(this.card.mesh.position.x + CARD_WIDTH / 2 - SKIP_WIDTH / 2, -this.card.mesh.scale.y / 2 - SKIP_HEIGHT / 2 - 0.008, 0.002);
       this.pinch.visible = step.pinch;
       if (import.meta.env.DEV) console.log(`[guide] step=${this.index + 1} ${step.title}`);
       this.workers.length = 0;
@@ -288,8 +354,10 @@ export class GuideSystem extends createSystem({
     // The card floats over the board, turned to the viewer; it steps aside
     // during a dive.
     const workspace = this.world.getSceneObject('workspace');
-    const hidden = dive.active || !workspace;
+    // The notes room explains itself (its panel and the side panel): no guide card there.
+    const hidden = dive.active || !workspace || (app.mode === 'room' && app.roomNode === NOTES_ROOM);
     this.holder.visible = !hidden;
+    this.setSkipPressable(!hidden);
     this.world.camera.getWorldPosition(this.head);
     if (workspace && !hidden) {
       this.holder.position.copy(app.mode === 'room' ? ROOM_ANCHOR : CARD_ANCHOR);
@@ -310,12 +378,42 @@ export class GuideSystem extends createSystem({
       this.ring.scale.setScalar(flash >= 0 ? 1 + flash * 1.6 : 1);
     }
 
+    if (!hidden) this.pokeSkip();
     this.placeArrow(step.target, delta, time, hidden);
+  }
+
+  /** Skip tour takes rays and fingertips only while the card shows. */
+  private setSkipPressable(on: boolean): void {
+    const e = this.skipEntity;
+    if (!e) return;
+    if (on && !e.hasComponent(RayInteractable)) e.addComponent(RayInteractable);
+    else if (!on && e.hasComponent(RayInteractable)) e.removeComponent(RayInteractable);
+    if (on && !e.hasComponent(PokeInteractable)) e.addComponent(PokeInteractable);
+    else if (!on && e.hasComponent(PokeInteractable)) e.removeComponent(PokeInteractable);
+  }
+
+  /** A fingertip in Skip tour's own space (front: +z), into `tip`; true when over the button. */
+  private tipOverSkip(hand: 'left' | 'right', margin: number): boolean {
+    this.player.indexTipSpaces[hand].getWorldPosition(this.tip);
+    this.skip.worldToLocal(this.tip);
+    return Math.abs(this.tip.x) < SKIP_WIDTH / 2 + margin && Math.abs(this.tip.y) < SKIP_HEIGHT / 2 + margin;
+  }
+
+  /** A fingertip pushed through Skip tour, or a pinch made right at it, presses it. */
+  private pokeSkip(): void {
+    if (!this.world.renderer.xr.isPresenting) return;
+    for (const hand of ['left', 'right'] as const) {
+      const over = this.tipOverSkip(hand, 0.006);
+      const z = this.tip.z;
+      const before = this.skipTipZ[hand];
+      this.skipTipZ[hand] = over ? z : Infinity;
+      if (over && before > 0 && before < 0.05 && z <= 0.004 && z > -0.04) this.skipHit = true;
+    }
   }
 
   private placeArrow(target: Target, delta: number, time: number, hidden: boolean): void {
     let size = 0;
-    if (!hidden && target === 'building' && app.mode === 'table') {
+    if (!hidden && target === 'building' && app.mode === 'table' && !app.street) {
       this.suggested ??= this.findSuggested();
       if (this.suggested) {
         this.box.setFromObject(this.suggested);

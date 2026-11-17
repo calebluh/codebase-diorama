@@ -89,7 +89,9 @@ export type OnVoiceStart = (charsPerSecond: number) => void;
  * Says a line and resolves when it is finished. `seed` picks the robot's
  * voice; `at` is where its head is, so the voice comes from there.
  */
-export async function speak(text: string, seed = 0, at?: Vector3, onStart?: OnVoiceStart): Promise<void> {
+export async function speak(shown: string, seed = 0, at?: Vector3, onStart?: OnVoiceStart): Promise<void> {
+  // Code names are said as words: "cleanup_old_tasks" as "cleanup old tasks", not "underscore".
+  const text = shown.replace(/([A-Za-z0-9])_+(?=[A-Za-z0-9])/g, '$1 ');
   const gen = ++generation;
   stopAll();
   let started = false;
@@ -106,8 +108,19 @@ export async function speak(text: string, seed = 0, at?: Vector3, onStart?: OnVo
     rest = await speakCloud(text, CLOUD_VOICES[seed % CLOUD_VOICES.length], at, gen, begin);
   }
   if (!rest || gen !== generation) return;
+  // No cloud voice, and this browser has no voices of its own (the Quest
+  // Browser has none): the line can only be read. Say so once.
+  if (!('speechSynthesis' in window) || window.speechSynthesis.getVoices().length === 0) {
+    if (!silent) console.warn('[voice] no voice on this device: the server has no text-to-speech key (OPENAI_API_KEY) and the browser has no voices. Lines show in speech bubbles only.');
+    silent = true;
+  }
   return speakBrowser(rest, seed, begin);
 }
+
+let silent = false;
+
+/** True once a line could not be spoken aloud on this device (see speak). */
+export const voiceMissing = (): boolean => silent;
 
 export function stopSpeaking(): void {
   generation += 1;

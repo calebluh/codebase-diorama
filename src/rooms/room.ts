@@ -25,28 +25,32 @@ import {
   type UIKitMLAsset,
   Vector3,
 } from '@iwsdk/core';
-import { ask, markSpoken, speak, speakingSeconds, stopSpeaking, voiceLevel } from '../agent/client.js';
+import { ask, markSpoken, speak, speakingSeconds, stopSpeaking, voiceLevel, voiceMissing } from '../agent/client.js';
 import { LiveMic } from '../agent/live-mic.js';
 import { canRecord } from '../agent/recorder.js';
-import { leavesRoom, plainRequest, suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
+import { asksToLeave, leavesRoom, plainRequest, suggestedQuestions, type ChatTurn } from '../agent/prompt.js';
+import { NotesDesk } from '../notes/desk.js';
+import { MAX_SAID, noteCommand, type Note, type NoteMode, NOTES_IN_PROMPT, NOTES_NODE, NOTES_ROOM, readBack } from '../notes/scribe.js';
+import { appendNote, talkOver } from '../notes/store.js';
 import { answerOrder, asksForQuiz, asksToStopQuiz, heardAnswer, quizRound, type QuizQuestion } from '../agent/quiz.js';
 import { Carryable, Pipe, Worker } from '../diorama-components.js';
 import { resolveRef } from '../layout.js';
 import { dive, DIVE_FADE_AT } from '../transition.js';
 import { guideNote } from '../guide.js';
 import { isPaused, onPause, whenResumed } from '../pause.js';
-import { placement } from '../placement.js';
+import { placement, pressWord } from '../placement.js';
 import { app, currentStep, enterRoom, type Handoff, leaveRoom, nextStep, onChange, setQuiz, startFlow, stopFlow } from '../state.js';
 import { arrive, blip, click, pop, setListener, startAmbience, stopAmbience, whoosh } from '../audio/sound.js';
-import { addCeiling, addFloorMarkings, addPilasters, makeSwirl, Trail } from './dressing.js';
+import { addCeiling, addFloorMarkings, addPilasters, addWindows, makeSwirl, Trail } from './dressing.js';
+import { KIND_COLORS } from '../colors.js';
 import { thinkingLine } from './lines.js';
-import { ignoreRays } from '../rays.js';
+import { ignoreRays, takeRays } from '../rays.js';
 import { mergeStatic } from './merge.js';
 import { loadProps } from './props.js';
 import { makePropDecor, makePropStation, propsForTheme } from './stations.js';
 import { makeDecor, makeItem, makePalette, makeStation, pickTheme, type Theme } from './themes.js';
 import { type Mood, RobotCharacter } from './character.js';
-import { Bubble } from './worker.js';
+import { Bubble, codeBlock, warningTalkedAbout } from './worker.js';
 
 const ROOM_RADIUS = 5.2;
 const WALL_HEIGHT = 3.4;
@@ -88,7 +92,10 @@ type Task =
 
 interface WorkerState {
   rig: RobotCharacter;
+  /** The invisible capsule that pointers hit: the only part of a robot that takes rays or touches. */
   entity: Entity;
+  /** The robot's body, which takes none. */
+  body: Entity;
   name: string;
   bubble: Bubble;
   queue: Task[];
@@ -100,6 +107,12 @@ interface WorkerState {
   scripted: boolean;
   /** Being pointed at: stands still, faces the visitor, ring at the feet. */
   hovered: boolean;
+  /**
+   * When the pointer last left (seconds, performance clock). The robot keeps
+   * still a moment longer: a hand ray flickers off as the fingers pinch, and
+   * a robot that set off again then would walk away from the pinch.
+   */
+  hoverLeft: number;
   ring: Mesh;
   /** What the worker is doing with their body, beyond walking and carrying. */
   mood: Mood;
@@ -110,6 +123,8 @@ interface WorkerState {
   speechToken: number;
 }
 
+/** A robot stays still this long (seconds) after the pointer leaves it. */
+const HOVER_LINGER = 0.6;
 /** How far to either side of straight ahead a robot may stand to talk, in radians. */
 const TALK_ARC = 0.25;
 const TALK_ARC_NARROW = 0.06;
@@ -117,8 +132,16 @@ const TALK_ARC_NARROW = 0.06;
 const CHARS_PER_SECOND = 16;
 /** A ready answer waits at most this long for the "let me check" line to finish. */
 const ACK_GRACE_MS = 1500;
+/** Where a file card showing code floats, in the room: up and to the left, clear of the robot and its speech bubble. */
+const CODE_CARD = new Vector3(-0.62, 1.55, -1.0);
 /** The shortest time a flow step's note stays up, even if the voice was cut off. */
 const MIN_NOTE_SECONDS = 2.5;
+/**
+ * The longest a flow step may sit in a room without moving on: reading the
+ * note (up to 16 s), the request held out (10 s) and carried to a pipe
+ * (20 s) all fit inside it, with time to spare.
+ */
+const STEP_STALL_SECONDS = import.meta.env.DEV ? 90 : 60;
 
 interface Station {
   point: Vector3;
@@ -135,6 +158,8 @@ interface Station {
 const WORKER_HITBOX = new CylinderGeometry(0.42, 0.42, 1.3, 12);
 const RING_GEOMETRY = new TorusGeometry(0.42, 0.018, 6, 40);
 const HITBOX_MATERIAL = new MeshBasicMaterial({ visible: false });
+/** Around each pipe's swirl (radius 0.4): the area a ray may hit to choose that pipe. */
+const PIPE_HIT = new CircleGeometry(0.62, 20);
 
 /** Side-by-side spacing of standing spots at a station. */
 const SPOT_SPACING = 0.85;
@@ -216,6 +241,9 @@ export class RoomSystem extends createSystem({
   private packet: Packet | null = null;
   private handledStep = -1;
   private offRoomClock = 0;
+  /** The flow step this room last saw, and how long it has gone without moving on (see update). */
+  private stallStep = -1;
+  private stallClock = 0;
 
   // Conversation with one worker.
   private askPanel: UIKitMLAsset | undefined;
@@ -231,7 +259,12 @@ export class RoomSystem extends createSystem({
   private mic!: LiveMic;
   /** The visitor turned the mic off for this conversation. */
   private micOff = false;
+  /** The visitor opened the question list while the mic is on (it is folded away otherwise). */
+  private askOpen = false;
   private fileCard: Bubble | null = null;
+  /** The notes room: the project's notes and their panel, and the newest notes pinned to the far wall. */
+  private notesDesk!: NotesDesk;
+  private notePlaques: Bubble[] = [];
   private swirls: Mesh[] = [];
   /** Pinchable pipes and the invisible catch area around the request (see offerPacket). */
   private pipeEntities: Entity[] = [];
@@ -249,6 +282,8 @@ export class RoomSystem extends createSystem({
   private fadeTarget = 0;
   /** True while a room's props are loading behind the fade. */
   private preparing = false;
+  /** Notes room: the latest idea said while the last one was still being thought over. */
+  private nextNote: string | null = null;
   /** The building whose props were last fetched ahead of stepping inside. */
   private prefetched: string | null = null;
 
@@ -281,6 +316,20 @@ export class RoomSystem extends createSystem({
     this.world.createTransformEntity(this.fade, { persistent: true });
     this.cleanupFuncs.push(onChange(() => this.onStateChange()));
     this.wireAskPanel();
+    this.notesDesk = new NotesDesk(this.world, {
+      onMode: (mode) => this.announceMode(mode),
+      onUndo: (removed) => this.noteUndone(removed),
+      onRead: () => {
+        if (this.talking && !this.waiting) void this.say(this.talking, readBack(this.notesDesk.notes), this.titleFor(this.talking));
+      },
+      onMic: () => this.toggleMic(),
+      onDone: () => {
+        this.endConversation();
+        leaveRoom();
+      },
+      onChange: () => this.pinNotes(),
+    });
+    this.cleanupFuncs.push(...this.notesDesk.cleanup);
     // Headset off or the system menu up: close the microphone, and open it
     // again on return if a conversation is still going.
     this.cleanupFuncs.push(
@@ -297,7 +346,10 @@ export class RoomSystem extends createSystem({
       }),
       this.queries.hoveredWorkers.subscribe('disqualify', (entity) => {
         const worker = this.workers.find((w) => w.entity === entity);
-        if (worker) worker.hovered = false;
+        if (worker) {
+          worker.hovered = false;
+          worker.hoverLeft = performance.now() / 1000;
+        }
       }),
       this.queries.pressedWorkers.subscribe('qualify', (entity) => {
         const worker = this.workers.find((w) => w.entity === entity);
@@ -363,7 +415,8 @@ export class RoomSystem extends createSystem({
   private build(nodeId: string): void {
     const workspaceEntity = this.world.getSceneEntity('workspace');
     const theme = pickTheme(app.graph, nodeId);
-    const node = app.graph.nodes.find((n) => n.id === nodeId)!;
+    const notesRoom = nodeId === NOTES_ROOM;
+    const node = notesRoom ? NOTES_NODE : app.graph.nodes.find((n) => n.id === nodeId)!;
     const palette = makePalette(theme);
     this.theme = theme;
 
@@ -404,14 +457,40 @@ export class RoomSystem extends createSystem({
     addCeiling(staticGroup, theme, palette, ROOM_RADIUS, WALL_HEIGHT);
     addPilasters(staticGroup, theme, ROOM_RADIUS, WALL_HEIGHT);
     addFloorMarkings(staticGroup, theme, palette);
+    addWindows(staticGroup, app.graph.nodes.filter((n) => n.id !== nodeId).map((n) => KIND_COLORS[n.kind]), this.hash(nodeId), ROOM_RADIUS, WALL_HEIGHT);
+
+    // The room's own files on plaques round the side and back walls, biggest first.
+    const files = app.graph.files.filter((f) => f.n === nodeId).sort((a, b) => b.loc - a.loc).slice(0, 6);
+    const plaqueAngles = [118, -118, 145, -145, 172, -172];
+    files.forEach((f, i) => {
+      const a = (plaqueAngles[i] * Math.PI) / 180;
+      const plaque = new Bubble(1.6, theme.accent, 4);
+      plaque.setText(`${f.d} (${f.loc} lines)`, f.name);
+      plaque.mesh.position.set(Math.sin(a) * (ROOM_RADIUS - 0.3), 1.7, -Math.cos(a) * (ROOM_RADIUS - 0.3));
+      group.add(plaque.mesh);
+      this.bubbles.push(plaque);
+    });
 
     // Room sign on the far wall, straight ahead.
     const sign = new Bubble(2.2, theme.accent);
-    sign.setText(node.summary, `${node.label} · ${theme.place}`);
-    this.sign = { bubble: sign, text: node.summary, title: `${node.label} · ${theme.place}` };
+    const signTitle = `${notesRoom ? app.graph.project.name : node.label} · ${theme.place}`;
+    sign.setText(node.summary, signTitle);
+    this.sign = { bubble: sign, text: node.summary, title: signTitle };
     sign.mesh.position.set(0, 2.55, -(ROOM_RADIUS - 0.12));
     group.add(sign.mesh);
     this.bubbles.push(sign);
+
+    // The notes room pins the newest notes up on the far wall, either side of the sign.
+    if (notesRoom) {
+      this.notePlaques = [-27, 27, -46, 46].map((degrees) => {
+        const a = (degrees * Math.PI) / 180;
+        const plaque = new Bubble(1.5, theme.accent, 5);
+        plaque.mesh.position.set(Math.sin(a) * (ROOM_RADIUS - 0.3), 2.3, -Math.cos(a) * (ROOM_RADIUS - 0.3));
+        group.add(plaque.mesh);
+        this.bubbles.push(plaque);
+        return plaque;
+      });
+    }
 
     // The company's logo beside the sign: this building belongs to the project.
     const logoUrl = app.graph.project.logo;
@@ -448,7 +527,8 @@ export class RoomSystem extends createSystem({
     });
 
     // Background props near the wall, between and beside the stations.
-    const decorAngles = [-90, -28, 28, 90].map((d) => (d * Math.PI) / 180);
+    // A second ring behind and beside the visitor, so turning round is not a bare wall.
+    const decorAngles = [-90, -28, 28, 90, -130, 130, -160, 160].map((d) => (d * Math.PI) / 180);
     decorAngles.forEach((a, i) => {
       const kind = theme.decor[i % theme.decor.length];
       const prop = makePropDecor(kind) ?? makeDecor(kind, palette);
@@ -515,6 +595,8 @@ export class RoomSystem extends createSystem({
       pipe.addComponent(Pipe, { nodeId: p.nodeId });
       pipe.addComponent(RayInteractable);
       this.pipeEntities.push(pipe);
+      // A wider invisible disc around the pipe's mouth: easy to hit from the chair.
+      p.hole.add(new Mesh(PIPE_HIT, HITBOX_MATERIAL));
     }
     const catchArea = new Mesh(
       new SphereGeometry(0.24, 12, 8),
@@ -535,16 +617,20 @@ export class RoomSystem extends createSystem({
       // skinned robot's own mesh is stored in unscaled bind-pose units, so
       // ray tests against it miss the robot you see.
       ignoreRays(rig.root);
-      const hitbox = new Mesh(WORKER_HITBOX, HITBOX_MATERIAL);
-      hitbox.position.y = 0.6;
-      rig.root.add(hitbox);
+      const hitbox = takeRays(new Mesh(WORKER_HITBOX, HITBOX_MATERIAL));
+      hitbox.name = `hitbox:${name}`;
       // A glowing ring at the feet while the worker is pointed at.
       const ring = ignoreRays(new Mesh(RING_GEOMETRY, new MeshBasicMaterial({ color: theme.accent, transparent: true, opacity: 0.9 })));
       ring.rotation.x = -Math.PI / 2;
       ring.position.y = 0.02;
       ring.visible = false;
       rig.root.add(ring);
-      const entity = this.world.createTransformEntity(rig.root, { parent: this.roomEntity! });
+      // Only the capsule is interactable. Were the robot's body interactable,
+      // its skinned meshes (whose bounds are tens of metres across, see above)
+      // would catch every fingertip touch in the room, and no button could be tapped.
+      const body = this.world.createTransformEntity(rig.root, { parent: this.roomEntity! });
+      const entity = this.world.createTransformEntity(hitbox, { parent: body });
+      hitbox.position.set(0, 0.6, 0);
       entity.addComponent(Worker, { nodeId, name });
       entity.addComponent(RayInteractable);
       const item = ignoreRays(makeItem(theme.item, palette));
@@ -557,6 +643,7 @@ export class RoomSystem extends createSystem({
       return {
         rig,
         entity,
+        body,
         name,
         bubble,
         queue: [],
@@ -567,6 +654,7 @@ export class RoomSystem extends createSystem({
         stations: [i, (i + 1) % this.stations.length] as [number, number],
         scripted: false,
         hovered: false,
+        hoverLeft: -Infinity,
         ring,
         mood: 'idle' as Mood,
         speech: null,
@@ -615,6 +703,8 @@ export class RoomSystem extends createSystem({
     const handoff = app.handoff;
     app.handoff = null; // for this room or not, it is used up
     if (handoff?.toRoom === nodeId) this.startConversation(this.workers[1], handoff);
+    // The notes room is for talking: the note taker comes straight over.
+    if (notesRoom) this.startConversation(this.workers[1]);
   }
 
   private teardown(): void {
@@ -625,6 +715,7 @@ export class RoomSystem extends createSystem({
     for (const w of this.workers) {
       w.rig.dispose();
       w.entity.dispose();
+      w.body.dispose();
     }
     this.workers = [];
     this.roomEntity?.dispose();
@@ -632,6 +723,7 @@ export class RoomSystem extends createSystem({
     this.roomGroup = null;
     this.packet = null;
     this.sign = null;
+    this.notePlaques = [];
     this.builtNode = null;
     this.stations = [];
     this.portals = [];
@@ -657,11 +749,20 @@ export class RoomSystem extends createSystem({
     this.askPanel = panel;
     if (!panel) return;
     this.showAskPanel(false);
-    const on = (id: string, handler: () => void) => {
+    // A pinch or a fingertip tap can land twice in a moment: a repeat inside
+    // `quiet` is ignored, so Quiz me and the mic do not switch on and straight off.
+    const on = (id: string, handler: () => void, quiet = 450) => {
       const el = panel.getElementById(id);
       if (!el) return;
-      el.addEventListener('click', handler);
-      this.cleanupFuncs.push(() => el.removeEventListener('click', handler));
+      let last = -Infinity;
+      const once = () => {
+        const now = performance.now();
+        if (now - last < quiet) return;
+        last = now;
+        handler();
+      };
+      el.addEventListener('click', once);
+      this.cleanupFuncs.push(() => el.removeEventListener('click', once));
     };
     for (let i = 0; i < 4; i += 1) on(`q-${i}`, () => {
       click();
@@ -672,9 +773,14 @@ export class RoomSystem extends createSystem({
       click();
       if (this.quiz) this.stopQuiz();
       else this.startQuiz();
-    });
+    }, 900);
     on('btn-done', () => this.endConversation());
-    on('btn-mic', () => this.toggleMic());
+    on('btn-mic', () => this.toggleMic(), 900);
+    on('btn-expand', () => {
+      click();
+      this.askOpen = !this.askOpen;
+      this.layoutAsk();
+    });
     if (!canRecord()) panel.getElementById('btn-mic')?.setProperties({ display: 'none' });
     this.mic = new LiveMic({
       onSpeechStart: () => {
@@ -687,13 +793,16 @@ export class RoomSystem extends createSystem({
       },
       onPartial: (text) => {
         const w = this.talking;
+        // In the notes room the mic stays open while an idea is thought over: show the next one on the desk.
+        if (w && this.waiting && this.builtNode === NOTES_ROOM && !this.isEcho(text)) this.notesDesk.live(text);
         if (!w || this.waiting || this.isEcho(text)) return;
         // The visitor is cutting in: stop talking and listen.
         if (w.mood === 'talking') {
-          if (text.trim().split(/s+/).length < 2) return;
+          if (text.trim().split(/\s+/).length < 2) return;
           this.interrupt(w);
         }
         w.bubble.setText(text, 'YOU');
+        if (this.builtNode === NOTES_ROOM) this.notesDesk.live(text);
       },
       onTurn: (text) => {
         if (this.isEcho(text)) return;
@@ -731,6 +840,7 @@ export class RoomSystem extends createSystem({
       this.askPanel?.getElementById(`q-${i}`)?.setProperties({ display: q ? 'flex' : 'none' });
       if (q) this.setAskText(`q-label-${i}`, q);
     }
+    this.layoutAsk();
   }
 
   /**
@@ -766,18 +876,22 @@ export class RoomSystem extends createSystem({
   }
 
   private titleFor(w: WorkerState, suffix = ''): string {
-    return `${w.name} | ${this.theme?.role ?? ''}${suffix}`;
+    // Once it is clear this device cannot speak, the bubble says so, so silence is never a mystery.
+    const quiet = voiceMissing() ? ' | no voice here' : '';
+    return `${w.name} | ${this.theme?.role ?? ''}${suffix}${quiet}`;
   }
 
   /** The worker walks over to talk, faces the viewer and greets them. */
   private startConversation(w: WorkerState, handoff?: Handoff): void {
     if (!this.builtNode || !this.theme) return;
     this.endConversation();
-    guideNote('talked');
+    const notesRoom = this.builtNode === NOTES_ROOM;
+    if (!notesRoom) guideNote('talked');
     if (app.stepIndex >= 0 && w === this.workers[0]) stopFlow();
-    const node = app.graph.nodes.find((n) => n.id === this.builtNode)!;
+    const node = notesRoom ? NOTES_NODE : app.graph.nodes.find((n) => n.id === this.builtNode)!;
     this.talking = w;
     this.history = [];
+    this.askOpen = false;
     this.questions = suggestedQuestions(app.graph, this.builtNode);
 
     // Come within comfortable talking distance, in front of the viewer and
@@ -809,6 +923,20 @@ export class RoomSystem extends createSystem({
         { role: 'assistant', content: greeting },
       );
     }
+    if (notesRoom) {
+      // The note taker: the notes panel takes the place of the questions.
+      this.notesDesk.open(app.mapId, app.graph);
+      this.pinNotes();
+      const count = this.notesDesk.notes.length;
+      const have = count === 0 ? '' : count === 1 ? ' You have one note so far.' : ` You have ${count} notes so far.`;
+      greeting =
+        this.notesDesk.mode === 'exact'
+          ? `Hi, I'm ${w.name}, the note taker for ${app.graph.project.name}.${have} I am writing word for word: just talk, and say "scratch that" to take one back.`
+          : `Hi, I'm ${w.name}, the note taker for ${app.graph.project.name}.${have} Tell me an idea and we will talk it over before I write it down. Say "word for word" if you only want it written.`;
+      void this.say(w, greeting, this.titleFor(w));
+      void this.openMic();
+      return;
+    }
     void this.say(w, greeting, this.titleFor(w));
 
     this.showAskHeader(w);
@@ -826,10 +954,129 @@ export class RoomSystem extends createSystem({
     this.setAskText('quiz-label', 'Quiz me');
   }
 
+  // -------------------------------------------------------------- notes
+
+  /** Words heard in the notes room: a spoken command, or an idea to write down. */
+  private async takeNote(said: string): Promise<void> {
+    const w = this.talking;
+    const desk = this.notesDesk;
+    if (!w || !this.theme) return;
+    if (this.waiting) {
+      // Still thinking the last one over: keep this one (the latest wins) and take it next.
+      this.nextNote = said;
+      desk.live(`Next: ${said}`);
+      if (import.meta.env.DEV) console.log(`[notes] held while thinking: ${said}`);
+      return;
+    }
+    desk.live('');
+    if (said.trim().split(/\s+/).length <= 10 && asksToLeave(said)) {
+      this.endConversation();
+      leaveRoom();
+      return;
+    }
+    const command = noteCommand(said);
+    if (command === 'undo') return this.noteUndone(desk.undo());
+    if (command === 'read') return void this.say(w, readBack(desk.notes), this.titleFor(w));
+    if (command === 'exact' || command === 'talk') {
+      // Switching tells the visitor through onMode; asking for the mode already on is confirmed here.
+      if (desk.mode === command) this.announceMode(command);
+      else desk.setMode(command);
+      return;
+    }
+
+    if (desk.mode === 'exact') {
+      // Dictation: written exactly as heard, and no talking back over the visitor.
+      desk.add(said, 'exact');
+      this.noteWritten(w, said);
+      return;
+    }
+
+    // Talk it over: the note taker answers, and writes the idea down tight.
+    this.waiting = true;
+    const talk = this.conversation;
+    stopSpeaking();
+    this.hush(w);
+    w.mood = 'thinking';
+    w.bubble.setText('Let me think about that...', this.titleFor(w));
+    const persona = { name: w.name, role: this.theme.role, place: this.theme.place };
+    const reply = await talkOver(
+      app.mapId,
+      persona,
+      said.slice(0, MAX_SAID),
+      desk.notes.slice(-NOTES_IN_PROMPT).map((n) => n.text),
+      this.history.slice(-4),
+    );
+    if (talk !== this.conversation) return;
+    this.waiting = false;
+    if (!reply) {
+      // Nobody to talk it over with (no server, no key, too slow): the idea is still kept.
+      desk.add(said, 'exact');
+      this.noteWritten(w, said);
+      void this.say(w, 'I could not think that one over just now, so I wrote it down exactly as you said it.', this.titleFor(w, ' (offline)')).then(() => this.takeNextNote());
+      return;
+    }
+    // A reply with no note line at all keeps the visitor's own words.
+    const note = reply.note ?? (reply.marked ? null : said);
+    if (note) {
+      if (reply.revise && desk.notes.length) desk.reviseLast(note);
+      else desk.add(note, reply.marked ? 'talk' : 'exact');
+      this.noteWritten(w, '');
+    }
+    this.history.push({ role: 'user', content: said }, { role: 'assistant', content: reply.say });
+    this.history = this.history.slice(-6);
+    // The next idea, if one was said meanwhile, once this reply has been heard.
+    void this.say(w, reply.say || 'Noted.', this.titleFor(w)).then(() => this.takeNextNote());
+  }
+
+  /** An idea said while the last was being thought over: taken now, so nothing said is lost. */
+  private takeNextNote(): void {
+    const next = this.nextNote;
+    this.nextNote = null;
+    if (next && this.builtNode === NOTES_ROOM && this.talking) void this.takeNote(next);
+  }
+
+  /** A note went down: a small sound and a nod, and in dictation the words in the bubble. */
+  private noteWritten(w: WorkerState, shown: string): void {
+    pop(this.worldPoint(w.rig.root.position).setY(1.1));
+    w.rig.gesture('Yes');
+    if (!shown) return;
+    this.hush(w);
+    w.bubble.setText(shown, 'NOTED');
+  }
+
+  private noteUndone(removed: Note | undefined): void {
+    const w = this.talking;
+    if (!w || this.waiting) return;
+    void this.say(w, removed ? 'Scratched. That one is gone.' : 'There is nothing to take back yet.', this.titleFor(w));
+  }
+
+  private announceMode(mode: NoteMode): void {
+    const w = this.talking;
+    if (!w || this.waiting) return;
+    const line =
+      mode === 'exact'
+        ? 'Word for word it is. I will write down exactly what you say.'
+        : 'Let us talk it over. Tell me the idea, and I will write it down once it is clear.';
+    void this.say(w, line, this.titleFor(w));
+  }
+
+  /** Shows the newest notes on the far wall of the notes room. */
+  private pinNotes(): void {
+    const notes = this.notesDesk.notes;
+    this.notePlaques.forEach((plaque, i) => {
+      const note = notes[notes.length - 1 - i];
+      plaque.setText(note?.text ?? '', note ? `Note ${notes.length - i}${note.part ? ` | ${note.part}` : ''}` : undefined);
+    });
+  }
+
   // --------------------------------------------------------------- quiz
 
   /** Words from the open microphone: a request for the quiz, an answer to it, or a question. */
   private heard(text: string): void {
+    if (this.builtNode === NOTES_ROOM) {
+      void this.takeNote(text);
+      return;
+    }
     const quiz = this.quiz;
     if (!quiz) {
       if (asksForQuiz(text)) this.startQuiz();
@@ -837,6 +1084,14 @@ export class RoomSystem extends createSystem({
       return;
     }
     if (quiz.marking || this.waiting || !this.builtNode) return;
+    // One of the three answers, said aloud, comes first: an answer can hold
+    // words that sound like "stop" ("...change plan or cancel").
+    const question = quiz.questions[quiz.index];
+    const picked = heardAnswer(quiz.order.map((i) => question.answers[i]), text);
+    if (picked !== null) {
+      this.answerQuiz(picked);
+      return;
+    }
     if (asksToStopQuiz(text)) {
       this.stopQuiz();
       return;
@@ -847,10 +1102,7 @@ export class RoomSystem extends createSystem({
       void this.askQuestion(text);
       return;
     }
-    const question = quiz.questions[quiz.index];
-    const picked = heardAnswer(quiz.order.map((i) => question.answers[i]), text);
-    if (picked !== null) this.answerQuiz(picked);
-    else void this.markSpokenAnswer(text);
+    void this.markSpokenAnswer(text);
   }
 
   /** The worker tests the visitor on its own room: a few questions, three answers each. */
@@ -873,7 +1125,7 @@ export class RoomSystem extends createSystem({
     this.sign?.bubble.setText('Quiz in progress.', this.sign.title);
     setQuiz(true);
     const count = questions.length === 1 ? 'One question' : `${questions.length} questions`;
-    this.askQuizQuestion(`Quiz time. ${count} about this room. Pinch an answer, or say it. `);
+    this.askQuizQuestion(`Quiz time. ${count} about this room. ${pressWord()} an answer, or say it. `);
   }
 
   /** Puts the current question on the panel and has the worker ask it. */
@@ -891,6 +1143,7 @@ export class RoomSystem extends createSystem({
       this.askPanel?.getElementById(`q-${i}`)?.setProperties({ display: i < 3 ? 'flex' : 'none' });
       if (i < 3) this.setAskText(`q-label-${i}`, question.answers[quiz.order[i]]);
     }
+    this.layoutAsk();
     void this.say(w, lead + question.prompt, this.titleFor(w, ' | quiz'));
   }
 
@@ -922,7 +1175,7 @@ export class RoomSystem extends createSystem({
     if (this.quiz !== quiz || quiz.index !== index || quiz.marking) return;
     this.waiting = false;
     if (mark) void this.markQuiz(mark.right, mark.say);
-    else void this.say(w, 'I could not tell which answer you meant. Pinch one, or say first, second or third.', this.titleFor(w, ' | quiz'));
+    else void this.say(w, `I could not tell which answer you meant. ${pressWord()} one, or say first, second or third.`, this.titleFor(w, ' | quiz'));
   }
 
   /** The worker says whether the answer was right, corrects it if not, and moves on. */
@@ -977,7 +1230,7 @@ export class RoomSystem extends createSystem({
     const line =
       quiz.score === total
         ? `That is the quiz: ${total} out of ${total}. You know ${room} as well as I do.`
-        : `That is the quiz: ${quiz.score} out of ${total}. Ask me about anything you missed, or pinch Quiz me for another go.`;
+        : `That is the quiz: ${quiz.score} out of ${total}. Ask me about anything you missed, or ${pressWord().toLowerCase()} Quiz me for another go.`;
     this.rememberQuiz(quiz, total, line);
     this.closeQuiz();
     w.rig.gesture(quiz.score === total ? 'ThumbsUp' : 'Wave');
@@ -1060,8 +1313,15 @@ export class RoomSystem extends createSystem({
         { kind: 'face', at: new Vector3(0, 0, 0) },
       );
     } else w.rig.gesture('Yes');
+    // A suggested fix goes on the project's notes list, under this room's name.
+    const note = reply.actions.find((a) => a.type === 'add_note');
+    if (note?.type === 'add_note') {
+      const room = app.graph.nodes.find((n) => n.id === nodeId)?.label;
+      appendNote(app.mapId, app.graph, note.text, room);
+      if (import.meta.env.DEV) console.log(`[notes] added from ${w.name}: ${note.text.slice(0, 80)}`);
+    }
     const file = reply.actions.find((a) => a.type === 'show_file');
-    if (file?.type === 'show_file') this.showFileCard(file.path);
+    if (file?.type === 'show_file') this.showFileCard(file.path, `${reply.answer} ${note?.type === 'add_note' ? note.text : ''}`);
 
     const answer = reply.answer || 'Right this way.';
     const cuts = this.cutIns;
@@ -1147,14 +1407,29 @@ export class RoomSystem extends createSystem({
     return best?.id ?? null;
   }
 
-  /** A card for one of the room's files, floating to the viewer's left. */
-  private showFileCard(path: string): void {
+  /**
+   * A card for one of the room's files, floating to the viewer's left. A file
+   * with a warning shows the flagged lines (maps built with code excerpts);
+   * with two warnings, the one the robot is talking about (`said`).
+   */
+  private showFileCard(path: string, said = ''): void {
     const file = app.graph.files.find((f) => f.p === path);
     if (!file || !this.roomGroup || !this.theme) return;
     this.hideFileCard();
-    const card = new Bubble(0.7, this.theme.accent, 8);
-    card.setText(`${file.d} (${file.loc} lines, ${file.p})`, `File: ${file.name}`);
-    card.mesh.position.set(-0.32, 1.42, -1.15); // up and left of centre, clear of the side panels
+    const issue = warningTalkedAbout(
+      (app.graph.health?.issues ?? []).filter((i) => i.excerpt && i.locations?.[0]?.file === path),
+      said,
+    );
+    const code = issue?.excerpt ? codeBlock(issue.excerpt) : undefined;
+    const card = new Bubble(0.7, this.theme.accent, code ? 3 : 8);
+    if (code && issue) {
+      // The flagged lines: just the file and the warning in words above them, so the card stays clear of the robot.
+      card.setText(`Line ${issue.locations?.[0]?.line ?? '?'}: ${issue.title}. (${file.p})`, `File: ${file.name}`, code);
+      card.mesh.position.set(CODE_CARD.x, CODE_CARD.y, CODE_CARD.z);
+    } else {
+      card.setText(`${file.d} (${file.loc} lines, ${file.p})`, `File: ${file.name}`);
+      card.mesh.position.set(-0.32, 1.42, -1.15); // up and left of centre, clear of the side panels
+    }
     this.roomGroup.add(card.mesh);
     this.bubbles.push(card);
     this.fileCard = card;
@@ -1191,6 +1466,20 @@ export class RoomSystem extends createSystem({
   private updateMicLabel(): void {
     const label = this.micOff || !this.mic?.active ? 'Mic off' : 'Mic on - just talk';
     this.setAskText('mic-label', label);
+    this.notesDesk?.setMicLabel(this.micOff || !this.mic?.active ? 'Mic off' : 'Mic on');
+    this.layoutAsk();
+  }
+
+  /**
+   * Talking out loud, the visitor needs no list of questions in the way: it
+   * folds away to a Questions button. A quiz always shows its three answers.
+   */
+  private layoutAsk(): void {
+    const voice = !this.micOff && !!this.mic?.active;
+    const folded = voice && !this.askOpen && !this.quiz;
+    this.askPanel?.getElementById('ask-list')?.setProperties({ display: folded ? 'none' : 'flex' });
+    this.askPanel?.getElementById('btn-expand')?.setProperties({ display: voice && !this.quiz ? 'flex' : 'none' });
+    this.setAskText('expand-label', this.askOpen ? 'Hide' : 'Questions');
   }
 
   /** Words to help recognition: room names in the building and this room's files. */
@@ -1237,9 +1526,11 @@ export class RoomSystem extends createSystem({
     this.mic?.stop();
     this.updateMicLabel();
     this.showAskPanel(false);
+    this.notesDesk?.close();
     const w = this.talking;
     this.talking = null;
     this.waiting = false;
+    this.nextNote = null;
     this.conversation += 1;
     if (!w) return;
     this.hush(w);
@@ -1253,6 +1544,7 @@ export class RoomSystem extends createSystem({
   /** If the current flow step happens in this room, script its handling. */
   private maybeHandleStep(): void {
     const step = currentStep();
+    if (import.meta.env.DEV && step) console.log(`[step] ${app.stepIndex} in ${step.nodeId}; built ${this.builtNode}; handled ${this.handledStep}; lead talking ${this.workers[0] === this.talking}`);
     if (!step || !this.builtNode || step.nodeId !== this.builtNode || this.handledStep === app.stepIndex) return;
     this.handledStep = app.stepIndex;
     const index = app.stepIndex;
@@ -1533,7 +1825,8 @@ export class RoomSystem extends createSystem({
 
     // The mic stays open while the worker talks, so the visitor can cut in
     // (see isEcho); it is only closed while the answer is being worked out.
-    if (this.talking && this.mic) this.mic.muted = this.waiting;
+    // In the notes room it stays open: an idea said meanwhile is kept for next (see takeNote).
+    if (this.talking && this.mic) this.mic.muted = this.waiting && this.builtNode !== NOTES_ROOM;
 
     const packet = this.packet;
     if (packet?.flying) {
@@ -1551,6 +1844,13 @@ export class RoomSystem extends createSystem({
     if (packet?.group.visible) packet.group.rotation.y = time * 1.5;
     this.trail?.update(delta, packet?.flying ? packet.group.position : null);
     for (const swirl of this.swirls) swirl.rotateZ(delta * 1.2);
+    // Carrying the request, the pipe pointed at swells: that is where it will go.
+    // (Not otherwise: a pipe takes a pinch only while a request is carried.)
+    const carrying = this.offer?.carrying === true;
+    for (const pipe of this.pipeEntities) {
+      const hole = pipe.object3D;
+      if (hole) hole.scale.setScalar(carrying && pipe.hasComponent(Hovered) ? 1.3 : 1);
+    }
 
     // A flow step in another room (Follow off): keep the story moving.
     const step = currentStep();
@@ -1561,6 +1861,27 @@ export class RoomSystem extends createSystem({
         nextStep();
       }
     } else this.offRoomClock = 0;
+
+    // A flow step in this room must never sit still (one stalled for minutes
+    // in a test, cause not reproduced). A step this room missed (it arrived
+    // mid-fade, say) is taken up now; one that makes no progress for
+    // STEP_STALL_SECONDS moves on, as the lead would have done itself.
+    if (step && step.nodeId === this.builtNode && this.fadeLevel === 0) {
+      if (this.handledStep !== app.stepIndex) this.maybeHandleStep();
+      const carrying = this.offer?.carrying === true || this.packet?.flying === true;
+      if (app.stepIndex === this.stallStep && !carrying && !this.talking) {
+        this.stallClock += delta;
+        if (this.stallClock > STEP_STALL_SECONDS) {
+          if (import.meta.env.DEV) console.warn(`[step] ${app.stepIndex} made no progress for ${STEP_STALL_SECONDS} s: moving on`);
+          this.stallClock = 0;
+          this.endOffer();
+          nextStep();
+        }
+      } else {
+        this.stallStep = app.stepIndex;
+        this.stallClock = 0;
+      }
+    } else this.stallClock = 0;
   }
 
   private updateFade(delta: number): void {
@@ -1571,12 +1892,26 @@ export class RoomSystem extends createSystem({
       if (this.builtNode) this.teardown();
       if (desired) {
         this.preparing = true;
-        void loadProps(propsForTheme(pickTheme(app.graph, desired))).then(() => {
-          this.preparing = false;
-          const now = this.desiredNode();
-          if (now) this.build(now);
-          this.fadeTarget = 0;
-        });
+        // Whatever goes wrong, the view fades back in: a room that fails to
+        // build sends the visitor back to the city rather than leaving them in the dark.
+        void loadProps(propsForTheme(pickTheme(app.graph, desired)))
+          .then(() => {
+            const now = this.desiredNode();
+            if (now) this.build(now);
+          })
+          .catch((error: unknown) => {
+            console.error('[room] could not build the room, back to the city:', error);
+            try {
+              this.teardown();
+            } catch {
+              // half built: nothing more to undo
+            }
+            leaveRoom();
+          })
+          .finally(() => {
+            this.preparing = false;
+            this.fadeTarget = 0;
+          });
       } else this.fadeTarget = 0;
     }
     const step = delta / FADE_SECONDS;
@@ -1591,8 +1926,9 @@ export class RoomSystem extends createSystem({
 
   private updateWorker(w: WorkerState, delta: number): void {
     w.ring.visible = w.hovered && w !== this.talking;
-    // Pointed at (and not busy with a flow step): stop and look at the visitor.
-    if (w.hovered && !w.scripted) {
+    // Pointed at (or just now), and not busy with a flow step: stop and look at the visitor.
+    const held = w.hovered || performance.now() / 1000 - w.hoverLeft < HOVER_LINGER;
+    if (held && !w.scripted) {
       this.tmp2.set(0, 0, 0).sub(w.rig.root.position);
       this.turnToward(w, Math.atan2(this.tmp2.x, this.tmp2.z), delta);
       this.applyPose(w, false, delta);

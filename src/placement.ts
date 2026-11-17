@@ -12,12 +12,34 @@
 export const NEAR = { reach: 0.7, drop: 0.42 } as const;
 export const FAR = { reach: 0.95, drop: 0.36 } as const;
 
-export const placement: { reach: number; drop: number; gaze: boolean; recentre: () => void } = {
+export const placement: {
+  reach: number;
+  drop: number;
+  gaze: boolean;
+  mixed: boolean;
+  onTable: boolean;
+  recentre: () => void;
+  returnToTable: () => void;
+} = {
   ...NEAR,
   gaze: false,
+  /** The visitor is in mixed reality: the real room shows around the city. */
+  mixed: false,
+  /** Mixed reality: the city is standing on a real table the headset found in the room. */
+  onTable: false,
   /** Puts the desk back in front of the viewer (set by WorkspaceSystem; does nothing outside VR). */
   recentre: () => undefined,
+  /**
+   * Back from a room: the desk goes back where the visitor had put it (on
+   * their real table, or wherever they dragged it), unless they have turned
+   * away from it in the room; then it comes round in front of them.
+   * (Set by WorkspaceSystem; does nothing outside VR.)
+   */
+  returnToTable: () => undefined,
 };
+
+/** How a button is pressed: tapped with a fingertip by hand, pinched where the eyes do the aiming. */
+export const pressWord = (): string => (placement.gaze ? 'Pinch' : 'Tap');
 
 /** "Point at" for hands on a Quest, "Look at" where the eyes do the aiming. */
 export const aimWord = (): string => (placement.gaze ? 'Look at' : 'Point at');

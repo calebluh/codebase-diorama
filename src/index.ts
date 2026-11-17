@@ -4,7 +4,8 @@ import { DioramaSystem } from './diorama.js';
 import { RoomSystem } from './rooms/room.js';
 import { pickTheme } from './rooms/themes.js';
 import { MAPS } from './maps/index.js';
-import { app, chooseDemo, cycleMap, enterRoom, leaveRoom, nextStep, select, startFlow } from './state.js';
+import { NOTES_ROOM } from './notes/scribe.js';
+import { app, chooseDemo, cycleMap, enterRoom, leaveRoom, nextStep, select, setStreet, startFlow } from './state.js';
 import { stopSpeaking } from './agent/client.js';
 import { warmVoice } from './agent/voice.js';
 import { pauseAudio, resumeAudio, unlock } from './audio/sound.js';
@@ -16,6 +17,9 @@ import { landingFailed, landingReady } from './landing.js';
 import { restartGuide } from './guide.js';
 import { WorkspaceSystem } from './workspace.js';
 import { DesktopControlsSystem } from './desktop-controls.js';
+import { ScreenSystem } from './screen.js';
+import { FpsSystem } from './fps.js';
+import { listenForMapUpdates } from './live.js';
 
 // Eye tracking is only for Meta VR Glasses (open with ?gaze). Asking for it
 // crashes the Quest 2 browser at page load, and Quest has no eye tracking.
@@ -39,10 +43,33 @@ World.create(
   world.registerSystem(GuideSystem);
   world.registerSystem(AtmosphereSystem);
   world.registerSystem(DesktopControlsSystem);
+  // Development: your computer's screen on a monitor behind the city (/share), and
+  // maps rebuilt by a coding agent swapped in without leaving VR.
+  if (import.meta.env.DEV) {
+    world.registerSystem(ScreenSystem);
+    world.registerSystem(FpsSystem);
+    listenForMapUpdates();
+  }
 
   // A link straight to one map (the Claude skill prints one) skips the menu.
   const wanted = new URLSearchParams(location.search).get('map');
   if (wanted && MAPS[wanted]) chooseDemo(wanted);
+
+  // Development: ?tour visits the table, a room and street view on a timer
+  // once the VR session starts, so a headset nobody is wearing can be
+  // measured (src/fps.ts reports each place).
+  if (import.meta.env.DEV && params.has('tour')) {
+    world.renderer.xr.addEventListener('sessionstart', () => {
+      const leaf = app.graph.nodes.find((n) => n.id === 'api.routes') ?? app.graph.nodes.find((n) => !app.graph.nodes.some((c) => c.parent === n.id) && n.kind !== 'external');
+      const at = (seconds: number, step: () => void) => setTimeout(step, seconds * 1000);
+      at(1, () => chooseDemo(app.mapId));
+      at(30, () => leaf && enterRoom(leaf.id));
+      at(60, () => leaveRoom());
+      at(68, () => setStreet(true));
+      at(98, () => setStreet(false));
+      console.log('[tour] table 0-30 s, room 30-60 s, street 68-98 s, then table');
+    });
+  }
 
   // A Quest 2 has about a third of a Quest 3's graphics power: draw slightly
   // fewer pixels there so turning the head stays smooth.
@@ -95,6 +122,8 @@ World.create(
       if (e.key === 'h') select('shared');
       if (e.key === 'a') select('admin');
       if (e.key === 'w') world.getSystem(RoomSystem)?.debugTalk();
+      // `: talk to the lead robot (the one that carries a flow's request), as pinching it would.
+      if (e.key === '`') world.getSystem(RoomSystem)?.debugTalk(0);
       if (e.key === 'q') world.getSystem(RoomSystem)?.debugAsk(0);
       if (e.key === 'e') world.getSystem(RoomSystem)?.debugAsk(2);
       if (e.key === 'g') world.getSystem(RoomSystem)?.debugAskText('Can you take me to billing day?');
@@ -103,6 +132,7 @@ World.create(
       const digit = Number(e.key);
       if (digit >= 1 && digit <= 9) enterRoom(rooms[digit - 1]);
       if (e.key === 'm') cycleMap();
+      if (e.key === '-') setStreet(!app.street);
       // 0: close the start menu on the current map (emulator presses can be too slow to click).
       if (e.key === '0') chooseDemo(app.mapId);
       if (e.key === 'u') restartGuide();
@@ -145,6 +175,13 @@ World.create(
       if (e.key === 'x') world.getSystem(RoomSystem)?.debugQuizAnswer(false);
       if (e.key === 'c') world.getSystem(RoomSystem)?.debugHear('I think it takes the card payments and gives refunds');
       if (e.key === 'd') world.getSystem(RoomSystem)?.debugHear('ok quiz me');
+      // Notes room: = goes in, ; says an idea, ' takes the last note back.
+      if (e.key === '=') enterRoom(NOTES_ROOM);
+      if (e.key === ';') world.getSystem(RoomSystem)?.debugHear('We should let people pause a meal kit for a week instead of cancelling.');
+      if (e.key === "'") world.getSystem(RoomSystem)?.debugHear('scratch that');
+      if (e.key === '[') world.getSystem(RoomSystem)?.debugHear('word for word');
+      if (e.key === ']') world.getSystem(RoomSystem)?.debugHear('talk it over');
+      if (e.key === ',') world.getSystem(RoomSystem)?.debugHear('Actually make it two weeks, and only for people on the yearly plan.');
     });
   }
 }).catch((error) => {

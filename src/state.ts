@@ -20,6 +20,8 @@ export const app = {
   graph: MAPS[DEFAULT_MAP] as GraphData,
   /** `table`: the diorama on the desk. `room`: sitting inside one part. */
   mode: 'table' as 'table' | 'room',
+  /** Street view: the city is life size around the visitor instead of on the desk. */
+  street: false,
   roomNode: null as string | null,
   selected: null as string | null,
   flowIndex: 0,
@@ -120,6 +122,7 @@ export function setMap(id: string): void {
   if (!graph || id === app.mapId) return;
   app.mapId = id;
   app.graph = graph;
+  app.street = false;
   app.mode = 'table';
   app.roomNode = null;
   app.selected = null;
@@ -131,14 +134,68 @@ export function setMap(id: string): void {
   emit();
 }
 
+/**
+ * Parts whose description, files or warnings changed in the last live map
+ * update, with the time (performance.now) they changed. The city makes them
+ * glow for a while so the change is seen.
+ */
+export const freshParts = new Map<string, number>();
+
+/** What a part looks like to a visitor: its words, its files and its warnings. */
+function partPrint(graph: GraphData | undefined, id: string): string {
+  if (!graph) return '';
+  const node = graph.nodes.find((n) => n.id === id);
+  const files = graph.files.filter((f) => f.n === id);
+  const paths = new Set(files.map((f) => f.p));
+  const issues = (graph.health?.issues ?? []).filter((i) => i.locations?.some((l) => paths.has(l.file)));
+  return JSON.stringify([node?.label, node?.summary, files.map((f) => [f.p, f.name, f.d]), issues.map((i) => [i.title, i.detail])]);
+}
+
+/**
+ * A map was rebuilt while the app is open (development: a coding agent
+ * updated it). Swaps it in place, keeping the visitor where they are.
+ */
+export function replaceMap(id: string, graph: GraphData): void {
+  const old = MAPS[id];
+  MAPS[id] = graph;
+  if (id !== app.mapId) return;
+  const now = performance.now();
+  for (const node of graph.nodes) {
+    if (partPrint(old, node.id) !== partPrint(graph, node.id)) freshParts.set(node.id, now);
+  }
+  if (import.meta.env.DEV) console.log(`[live] changed parts: ${[...freshParts.keys()].join(', ') || 'none'}`);
+  app.graph = graph;
+  const has = (n: string | null) => n !== null && graph.nodes.some((x) => x.id === n);
+  if (app.selected && !has(app.selected)) app.selected = null;
+  if (app.flowIndex >= graph.flows.length) app.flowIndex = 0;
+  app.flowSteps = [];
+  app.stepIndex = -1;
+  app.playing = false;
+  if (app.mode === 'room' && app.roomNode && !app.roomNode.startsWith('~') && !has(app.roomNode)) {
+    app.mode = 'table';
+    app.roomNode = null;
+    app.handoff = null;
+  }
+  emit();
+}
+
 export function cycleMap(): void {
   const ids = Object.keys(MAPS);
   setMap(ids[(ids.indexOf(app.mapId) + 1) % ids.length]);
 }
 
+/** Switches between the city on the desk (map view) and walking its streets. */
+export function setStreet(on: boolean): void {
+  if (app.street === on || app.mode !== 'table') return;
+  app.street = on;
+  app.selected = null;
+  emit();
+}
+
 /** Back to the start menu, from the table or a room. */
 export function openMenu(): void {
   app.menu = true;
+  app.street = false;
   app.mode = 'table';
   app.roomNode = null;
   app.selected = null;

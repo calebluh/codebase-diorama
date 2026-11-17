@@ -1,6 +1,6 @@
 ---
 name: map
-description: Turn a codebase into a walk-in VR diorama (Codebase Diorama for Meta Quest). Use when the user asks to map, visualize, tour or "step inside" a repository in VR or on a Quest, to build a Codebase Diorama map, or runs /codebase-diorama:map. Analyzes the repo read-only, writes a map of its parts, flows and files in plain English, then runs the viewer locally so robots in each room can answer questions about the code.
+description: Turn a codebase into a walk-in VR diorama (Codebase Diorama for Meta Quest). Use when the user asks to map, visualize, tour or "step inside" a repository in VR or on a Quest, to build a Codebase Diorama map, or runs /codebase-diorama:map. Analyzes the repo read-only, writes a map of its parts, flows and files in plain English, then runs the viewer locally so robots in each room can answer questions about the code. Needs a shell with git and Node 20+ on the user's own machine.
 ---
 
 # Codebase Diorama: map a repo
@@ -54,8 +54,8 @@ is ambiguous. Build a picture before writing anything:
    `go.mod`, ...), entry points, routing tables and config.
 3. Read every source file you will include, at least skimming. For repos over
    ~300 source files, map the product code only (skip generated code,
-   fixtures, migrations and vendored libraries) and consider splitting the
-   file descriptions across parallel subagents by folder.
+   fixtures, migrations and vendored libraries). If you can hand work to
+   subagents, consider splitting the file descriptions across them by folder.
 
 Pick a map id: the repo name in lowercase kebab-case, e.g. `acme-shop`.
 
@@ -77,7 +77,9 @@ labels like "Payments", "Inventory" or "Email" get fitting rooms.
 Run `mkdir -p "$VIEWER_DIR/maps-src/<id>"`, then create `map.mjs` and
 `arch.json` in that folder. The exact formats, with a worked
 example, are in [references/map-format.md](references/map-format.md). Read it
-before writing. Start from the templates in `templates/`.
+before writing. Start from the templates in `templates/`. (Both sit beside
+this file. If you were given this file on its own, they are also in the
+viewer, under `$VIEWER_DIR/plugins/codebase-diorama/skills/map/`.)
 
 `arch.json` must cover:
 
@@ -105,14 +107,14 @@ named on screen.
 ```bash
 cd "$VIEWER_DIR"
 node scripts/build-map.mjs "<target repo path>" --map maps-src/<id>/map.mjs --arch maps-src/<id>/arch.json --out src/maps/custom/<id>.json
-node "${CLAUDE_PLUGIN_ROOT}/skills/map/scripts/check-map.mjs" src/maps/custom/<id>.json
+node plugins/codebase-diorama/skills/map/scripts/check-map.mjs src/maps/custom/<id>.json
 npm run typecheck
 ```
 
 `build-map` throws if a file matches no part; reorder or widen part globs
 (most specific first). Fix everything `check-map` reports until it prints
-`ok`. If `CLAUDE_PLUGIN_ROOT` is unset, use the path this skill was loaded
-from.
+`ok`. (The checker ships inside the viewer, so that path works from
+`$VIEWER_DIR` whichever agent you are.)
 
 Logo (optional): if the repo has a square PNG logo or favicon, copy it to
 `public/maps/<id>/logo.png` and set `logo: 'maps/<id>/logo.png'` in
@@ -150,11 +152,46 @@ This starts the server and opens a browser with a headset emulator. Then:
 Without `?map=` the viewer opens the user's first map; the Next map button on
 the desk's control strip switches between their maps.
 
-Tell the user how to use it, briefly: point at a building and pinch to
-inspect it, pinch Step inside to enter its room, point at a robot and pinch to
-talk, and say or pinch a question. A short guided tour runs on first visit.
+Tell the user how to use it, briefly: point at a building and pinch, and
+its roof lifts to show the robots inside; pinch Step inside, over the
+building, to enter its room; point at a robot and pinch to talk, and say or
+pinch a question. Mixed reality stands the city on their real desk. A short
+guided tour runs on first visit.
 
 ## Updating a map
 
 When the code changes, re-read the changed files, update `map.mjs` and
 `arch.json`, and rerun step 5. The dev server reloads the map automatically.
+
+## Notes from the headset
+
+In the headset the user talks ideas over in the Notes room, and the robots
+put fixes they suggest on the same list. The viewer writes that list to
+`$VIEWER_DIR/notes/<id>.md`, one checklist line per note:
+
+```
+- [ ] Return a short error instead of the full traceback in simulation.py, report.py and graph.py. _(Endpoints, talked over, 2026-11-17 02:14)_
+```
+
+The part of the app in brackets (here Endpoints) is where the note was made
+or what it names. When the user asks you to work through their notes (or
+runs this skill and a notes file exists for the map):
+
+1. Read the file and show the open items (`- [ ]`) as a short numbered list.
+   Ask which to do; do not start on all of them unasked.
+2. For each one chosen: treat it as a suggestion, not a spec. A robot's fix
+   is drawn from the map alone (it has not seen the code), so check it
+   against the real code first and say plainly if it is wrong or already
+   done. Then make the change in the target repo as you normally would.
+3. Tick the line (`- [ ]` to `- [x]`) once the change is in. The viewer
+   keeps ticked lines ticked when it next writes the file.
+4. Update the map for the files you changed (see Updating a map) so the
+   city shows the change; a fix that clears a health warning should remove
+   that warning from `arch.json`. While the viewer runs, the rebuilt map
+   reaches the headset in place: the user stays in VR and the parts you
+   changed glow.
+
+To watch you work from inside the headset, the user can open
+`https://localhost:8081/share` on this computer and share the terminal
+window: it appears on a monitor behind the city. Mention this when they
+ask you to work through the notes with the headset on.
