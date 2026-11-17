@@ -8,8 +8,8 @@ description: Turn a codebase into a walk-in VR diorama (Codebase Diorama for Met
 Codebase Diorama shows a codebase as a little city on a desk in VR. Each part
 of the code is a building; step inside one and it becomes a themed room where
 robot workers run that part and answer questions about it, powered by the
-user's own Meta Model API key. Packets travel between rooms along the code's
-real flows.
+user's own Claude Code sign-in or Meta Model API key (step 6). Packets travel
+between rooms along the code's real flows.
 
 Your job: understand the target repository well enough to explain it to a
 non-programmer, write that understanding as a map, build it, and launch the

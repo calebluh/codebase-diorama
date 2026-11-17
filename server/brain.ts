@@ -139,6 +139,10 @@ class ClaudeBrain implements Brain {
             windowsHide: true,
           })
         : spawn('claude', args, { cwd: this.dir, env });
+    // A waiting process must not keep the dev server alive after it is told
+    // to stop. When the server exits, the pipe closes and the process ends.
+    child.unref();
+    for (const pipe of [child.stdin, child.stdout, child.stderr]) (pipe as unknown as { unref?: () => void } | null)?.unref?.();
     let stderr = '';
     child.stderr?.on('data', (d: Buffer) => (stderr = (stderr + d.toString()).slice(-600)));
     const result = new Promise<string>((resolve, reject) => {
