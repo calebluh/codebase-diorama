@@ -121,18 +121,39 @@ Logo (optional): if the repo has a square PNG logo or favicon, copy it to
 `map.mjs`, then rebuild. With no logo, leave the line out: the viewer draws
 a plain badge instead.
 
-## 6. Keys
+## 6. Who answers for the robots
 
-The robots answer using the Meta Model API. Ask the user to create a key at
-https://dev.meta.ai and add this line to `$VIEWER_DIR/.env.local` themselves:
+Ask the user which they want:
 
-```
-MODEL_API_KEY=LLM_...
-```
+- **Their Claude plan, no key.** If they use Claude Code (the `claude`
+  command works and is signed in), add this line to `$VIEWER_DIR/.env`
+  (settings only, no secrets; create the file if needed):
 
-Without a key the robots still talk, from canned answers built from your
-descriptions. Optional: `OPENAI_API_KEY=...` gives each robot a natural voice
-(otherwise the browser's built-in voice is used).
+  ```
+  ROBOT_BRAIN=claude
+  ```
+
+  The robots then answer through Claude Code (Haiku by default; set
+  `ROBOT_BRAIN_MODEL` to change it), in about 2 seconds. It runs with no
+  tools and none of the user's settings. This works only on the user's own
+  computer, which is where the viewer runs anyway.
+- **Meta's Model API.** Ask the user to create a key at https://dev.meta.ai
+  and add this line to `$VIEWER_DIR/.env.local` themselves:
+
+  ```
+  MODEL_API_KEY=LLM_...
+  ```
+
+Speech to text in the headset uses the Meta key in either case. Without it,
+the visitor pinches the suggested questions instead of speaking. Without any
+model the robots still talk, from canned answers built from your
+descriptions. Optional: `OPENAI_API_KEY=...` in `.env.local` gives each robot
+a natural voice (otherwise the browser's built-in voice is used).
+
+If you have the Codebase Diorama MCP tools (`diorama_*`), `diorama_use_brain`
+makes this change for you, and `diorama_setup`, `diorama_build_map`,
+`diorama_start` and `diorama_notes` stand in for the shell commands in
+steps 1, 5 and 7 and the notes section below.
 
 ## 7. Launch
 

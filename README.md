@@ -37,18 +37,72 @@ The skill is written once, in
 and copied to [`skills/codebase-diorama`](skills/codebase-diorama) for agents
 that install bare skills (`node scripts/sync-skills.mjs`).
 
-## Keys
+## MCP server: the same tools in any agent
 
-The keys go in `.env.local` in the viewer folder. Add them yourself; the file
-stays on your machine and the browser never sees them.
+The plugin also ships an MCP (Model Context Protocol) server,
+[`plugins/codebase-diorama/mcp/server.mjs`](plugins/codebase-diorama/mcp/server.mjs).
+It is one file with no dependencies, needing only Node 20+. It gives any
+agent that speaks MCP these tools:
+
+| Tool | What it does |
+| --- | --- |
+| `diorama_instructions` | The mapping skill and map format, for agents that do not load skills |
+| `diorama_setup` | Clones this viewer to `~/codebase-diorama` and installs it |
+| `diorama_build_map` | Builds and checks a map once the agent has written it |
+| `diorama_use_brain` | Robots answer through your Claude plan, or Meta's Model API |
+| `diorama_start` / `diorama_stop` | Runs the viewer and returns the link for your Quest |
+| `diorama_status` | Maps, open notes, who answers, and whether the viewer is running |
+| `diorama_notes` / `diorama_tick_note` | The notes you made in VR, and ticking them off as they are done |
+
+It also has two prompts, `map_repo` and `work_through_notes`.
+
+The Claude Code plugin and the Gemini CLI extension start it for you.
+Elsewhere, clone this repo (or let the skill do it), then register the
+server. Use the full path to the folder in place of `~` if your agent does
+not expand it.
+
+| Agent | Register |
+| --- | --- |
+| Claude Code (without the plugin) | `claude mcp add codebase-diorama -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
+| Codex | `codex mcp add codebase-diorama -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
+| Cursor, Windsurf, Claude Desktop and most others | add `"codebase-diorama": { "command": "node", "args": ["<home>/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs"] }` under `mcpServers` in the app's MCP settings |
+| VS Code (Copilot) | the same entry under `servers` in `.vscode/mcp.json` |
+
+Mapping a repo needs an agent that can read files and run a shell on your
+computer. A chat app without those, such as Claude Desktop, can still start
+the viewer and read and tick your notes.
+
+## Who answers for the robots
+
+Pick one. Settings go in `.env` in the viewer folder; keys go in
+`.env.local`. Add keys yourself: the file stays on your machine and the
+browser never sees them.
 
 ```sh
-MODEL_API_KEY=LLM_...      # Meta Model API (dev.meta.ai): the robots' answers and speech recognition
+# .env: your Claude plan, no key. Needs Claude Code installed and signed in on this computer.
+ROBOT_BRAIN=claude
+ROBOT_BRAIN_MODEL=haiku    # optional
+
+# .env.local: Meta Model API (dev.meta.ai), which also does speech recognition in the headset
+MODEL_API_KEY=LLM_...
 OPENAI_API_KEY=sk-...      # optional: natural robot voices; without it the browser's voice is used
+
+# .env: any OpenAI-compatible chat endpoint instead, e.g. a local Ollama (not yet tested with one)
+CHAT_API_BASE=http://localhost:11434/v1
+CHAT_MODEL=llama3.2
+# (CHAT_API_KEY=... in .env.local if the endpoint needs one)
 ```
 
-Without a Meta key the robots still talk, using canned answers built from the
-map.
+With `ROBOT_BRAIN=claude`, the viewer keeps a Claude Code process started in
+the background and hands each question to it. Each process answers one
+question and then exits. Over 18 test questions the median answer took 2.0
+seconds. Claude runs with no tools, no MCP servers and none of your settings,
+because visitor speech reaches it.
+
+Speech recognition still needs the Meta key. Without it, you pinch the
+suggested questions instead of speaking. With no model at all, the robots
+still talk, using canned answers built from the map. All of this is for the
+viewer on your own computer. The hosted demo uses Meta's Model API only.
 
 ## Running it
 
