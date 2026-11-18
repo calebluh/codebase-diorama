@@ -22,7 +22,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const VERSION = '0.3.0';
-const VIEWER_REPO = 'https://github.com/calebluh/codebase-diorama';
+const VIEWER_REPO = 'https://github.com/calebluh/walkthrough';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.join(HERE, '..', 'skills', 'map');
 const WIN = process.platform === 'win32';
