@@ -148,7 +148,8 @@ you make one, a small sample shop called Larder is shown.
   that was asked for, colouring it and fitting it on a card.
   `server/code-file.ts` reads the file from your project.
 - `src/agent/` and `server/`: the robots' conversations. Prompts are built on
-  the server from the map, so the page never sees an API key.
+  the server from the map and the lines of code a question is about, so the
+  page never sees an API key.
 - `src/guide-system.ts`, `src/atmosphere.ts`, `src/transition.ts`: the guided
   first visit, the surroundings and the dive into a building.
 - `scripts/build-map.mjs`: turns a repo plus a hand-written map into a map
