@@ -96,7 +96,24 @@ function maps(dir) {
     });
 }
 
-const notesFile = (dir, id) => path.join(dir, 'notes', `${id}.md`);
+/** The repository a map was built from, as build-map recorded it (maps-src/targets.json in the viewer). */
+function projectDir(dir, id) {
+  try {
+    const target = JSON.parse(fs.readFileSync(path.join(dir, 'maps-src', 'targets.json'), 'utf8'))[id];
+    return typeof target === 'string' && fs.statSync(target).isDirectory() ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A map's notes: walkthrough/notes.md in its own repository, or the viewer's notes/ for a map with no recorded repository. */
+function notesFile(dir, id) {
+  const viewerFile = path.join(dir, 'notes', `${id}.md`);
+  const project = projectDir(dir, id);
+  if (!project) return viewerFile;
+  const file = path.join(project, 'walkthrough', 'notes.md');
+  return fs.existsSync(file) || !fs.existsSync(viewerFile) ? file : viewerFile;
+}
 const CHECK = /^(\s*[-*]\s+\[)( |x|X)(\]\s+)(.*)$/;
 
 function readNotes(dir, id) {
@@ -220,7 +237,7 @@ const TOOLS = [
   {
     name: 'diorama_build_map',
     description:
-      'Build and check a map after writing maps-src/<id>/map.mjs and arch.json in the viewer folder (see diorama_instructions). Reads the repository; never runs its code. If the viewer is running, the headset gets the new map in place.',
+      'Build and check a map after writing map.mjs and arch.json in the walkthrough/ folder of the repository being mapped (see diorama_instructions). The build keeps the built map there too, and notes made in VR are written to walkthrough/notes.md in that repository; the folder ignores itself in git. Reads the repository; never runs its code. If the viewer is running, the headset gets the new map in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -234,7 +251,9 @@ const TOOLS = [
       if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(String(id))) throw new Problem('id must be lowercase kebab-case, at most 40 characters');
       const target = path.resolve(String(repo));
       if (!fs.existsSync(target)) throw new Problem(`No folder at ${target}`);
-      const src = path.join(dir, 'maps-src', id);
+      // The map's sources live in the repository's own walkthrough/ folder; maps-src/<id>/ in the viewer is the older place.
+      const older = path.join(dir, 'maps-src', id);
+      const src = fs.existsSync(path.join(older, 'map.mjs')) && !fs.existsSync(path.join(target, 'walkthrough', 'map.mjs')) ? older : path.join(target, 'walkthrough');
       for (const f of ['map.mjs', 'arch.json']) if (!fs.existsSync(path.join(src, f))) throw new Problem(`Missing ${path.join(src, f)}: write it first (see diorama_instructions).`);
       const out = path.join(dir, 'src', 'maps', 'custom', `${id}.json`);
       const build = await run(process.execPath, [path.join(dir, 'scripts', 'build-map.mjs'), target, '--map', path.join(src, 'map.mjs'), '--arch', path.join(src, 'arch.json'), '--out', out], { cwd: dir });
