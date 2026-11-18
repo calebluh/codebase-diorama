@@ -58,3 +58,17 @@ maps-src/
 .vercel
 .env*
 .playwright-mcp/
+
+# Kept locally, not published: AI-assistant setup and the stale plugin zip.
+/.claude/
+/.agents/skills/
+/.codex/
+/.cursor/
+/.github/instructions/
+/AGENTS.md
+/CLAUDE.md
+/src/AGENTS.md
+/public/scenes/AGENTS.md
+/public/ui/AGENTS.md
+/opencode.json
+/public/downloads/
