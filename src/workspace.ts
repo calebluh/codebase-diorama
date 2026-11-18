@@ -22,6 +22,7 @@ import { guideNote } from './guide.js';
 import { inPassthrough } from './passthrough.js';
 import { FAR, NEAR, placement } from './placement.js';
 import { setPanelsWithinReach } from './reach.js';
+import { resetMoves } from './grips.js';
 import { app, onChange } from './state.js';
 import { dive } from './transition.js';
 
@@ -245,6 +246,7 @@ export class WorkspaceSystem extends createSystem({}) {
       this.buildStripGrip();
     }
     placement.recentre = () => {
+      resetMoves();
       if (this.immersive) this.placeInFrontOfHead();
     };
     placement.returnToTable = () => {
@@ -267,7 +269,11 @@ export class WorkspaceSystem extends createSystem({}) {
 
     const recenter = this.world.getSceneObject<UIKitMLAsset>('controls-panel')?.getElementById('btn-recenter');
     if (recenter) {
-      const onRecenter = () => this.placeInFrontOfHead();
+      // Whatever the visitor moved by its own bar (panels, cards, bubbles) goes back to its place too.
+      const onRecenter = () => {
+        resetMoves();
+        this.placeInFrontOfHead();
+      };
       recenter.addEventListener('click', onRecenter);
       this.cleanupFuncs.push(() => recenter.removeEventListener('click', onRecenter));
     }
