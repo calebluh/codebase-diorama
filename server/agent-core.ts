@@ -14,6 +14,8 @@ import {
 } from '../src/agent/prompt.js';
 import { gradingPrompt, parseVerdict, quizFor } from '../src/agent/quiz.js';
 import { MAPS } from '../src/maps/index.js';
+import type { GraphData } from '../src/maps/types.js';
+import { findings, parseReview, plainReview, reviewPrompt, type ReviewReply } from './review.js';
 import { MAX_NOTE, MAX_SAID, NOTES_IN_PROMPT, parseScribe, scribePrompt, type ScribeReply } from '../src/notes/scribe.js';
 import { ACTION_LINES, activeBrain } from './brain.js';
 import { createLimiter } from './rate-limit.js';
@@ -42,6 +44,8 @@ const THIN_ANSWER = 90;
 const MIN_SECOND_TRY_MS = 3_500;
 /** Marking a quiz answer is one short reply; the visitor is waiting for a yes or no. */
 const MARK_TIMEOUT_MS = 9_000;
+/** The review is one longer reply; the visitor hears "give me a moment" meanwhile. */
+const REVIEW_TIMEOUT_MS = 12_000;
 
 export interface AgentRequest {
   mapId: string;
@@ -282,6 +286,29 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
   return { ...reply, actions };
 }
 
+/** The work order for a project: findings from the map, put in order and worded by whoever answers for the robots, when someone can. */
+export async function reviewProject(graph: GraphData, apiKey: string | undefined, model = DEFAULT_MODEL): Promise<ReviewReply> {
+  const found = findings(graph);
+  if (!(apiKey || activeBrain() || chatBase()) || found.length === 0) return plainReview(graph, found);
+  try {
+    const { system, user } = reviewPrompt(graph, found);
+    const reply = await complete(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      apiKey ?? '',
+      model,
+      REVIEW_TIMEOUT_MS,
+      false,
+    );
+    return parseReview(graph, found, reply.text);
+  } catch (e) {
+    console.warn(`[review] wording skipped: ${(e as Error)?.message ?? e}`);
+    return plainReview(graph, found); // slow or down: the findings stand as written
+  }
+}
+
 /**
  * An opening sentence that announces the answer instead of giving it: "I'm on
  * it - answering what I do here.", "Your cashier's ready - I'll get his
@@ -415,6 +442,16 @@ export async function handleAgent(
   address = 'local',
 ): Promise<{ status: number; json: unknown }> {
   try {
+    // "Review this project": the note taker writes a work order from the map (see review.ts).
+    if (!!body && typeof body === 'object' && (body as Record<string, unknown>).review === true) {
+      const mapId = str((body as Record<string, unknown>).mapId, 40, 'mapId');
+      const graph = MAPS[mapId];
+      if (!graph) throw new AgentError(404, `Unknown map "${mapId}"`);
+      if ((apiKey || activeBrain() || chatBase()) && !(perMinute.allow(address) && perHour.allow(address) && everyone.allow('all'))) {
+        throw new AgentError(429, 'Too many questions; try again in a minute');
+      }
+      return { status: 200, json: await reviewProject(graph, apiKey, model || undefined) };
+    }
     // The notes room sends an idea to talk over instead of a question about a room.
     const scribe = !!body && typeof body === 'object' && (body as Record<string, unknown>).scribe === true;
     const idea = scribe ? validateScribe(body) : null;
