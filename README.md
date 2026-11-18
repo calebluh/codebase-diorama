@@ -80,9 +80,9 @@ not expand it.
 
 | Agent | Register |
 | --- | --- |
-| Claude Code (without the plugin) | `claude mcp add codebase-diorama -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
-| Codex | `codex mcp add codebase-diorama -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
-| Cursor, Windsurf, Claude Desktop and most others | add `"codebase-diorama": { "command": "node", "args": ["<home>/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs"] }` under `mcpServers` in the app's MCP settings |
+| Claude Code (without the plugin) | `claude mcp add walkthrough -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
+| Codex | `codex mcp add walkthrough -- node ~/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs` |
+| Cursor, Windsurf, Claude Desktop and most others | add `"walkthrough": { "command": "node", "args": ["<home>/codebase-diorama/plugins/codebase-diorama/mcp/server.mjs"] }` under `mcpServers` in the app's MCP settings |
 | VS Code (Copilot) | the same entry under `servers` in `.vscode/mcp.json` |
 
 Mapping a repo needs an agent that can read files and run a shell on your
