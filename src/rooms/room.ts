@@ -39,6 +39,7 @@ import { dive, DIVE_FADE_AT } from '../transition.js';
 import { guideNote } from '../guide.js';
 import { isPaused, onPause, whenResumed } from '../pause.js';
 import { placement, pressWord } from '../placement.js';
+import { setPanelShown } from '../panels.js';
 import { app, currentStep, enterRoom, type Handoff, leaveRoom, nextStep, onChange, setQuiz, startFlow, stopFlow } from '../state.js';
 import { arrive, blip, click, pop, setListener, startAmbience, stopAmbience, whoosh } from '../audio/sound.js';
 import { addCeiling, addFloorMarkings, addPilasters, addWindows, makeSwirl, Trail } from './dressing.js';
@@ -50,7 +51,10 @@ import { loadProps } from './props.js';
 import { makePropDecor, makePropStation, propsForTheme } from './stations.js';
 import { makeDecor, makeItem, makePalette, makeStation, pickTheme, type Theme } from './themes.js';
 import { type Mood, RobotCharacter } from './character.js';
-import { Bubble, codeBlock, warningTalkedAbout } from './worker.js';
+import { Bubble } from './worker.js';
+import { CodeCard } from './code-card.js';
+import { type CodeRequest, findCode } from './code-fetch.js';
+import { CUSTOM_MAPS } from '../maps/index.js';
 
 const ROOM_RADIUS = 5.2;
 const WALL_HEIGHT = 3.4;
@@ -132,8 +136,48 @@ const TALK_ARC_NARROW = 0.06;
 const CHARS_PER_SECOND = 16;
 /** A ready answer waits at most this long for the "let me check" line to finish. */
 const ACK_GRACE_MS = 1500;
-/** Where a file card showing code floats, in the room: up and to the left, clear of the robot and its speech bubble. */
-const CODE_CARD = new Vector3(-0.62, 1.55, -1.0);
+/** How wide a robot's speech bubble is, in metres. */
+const SPEECH_WIDTH = 1.2;
+/**
+ * A file or code card stands this far from the visitor's head (metres): well
+ * inside the ring the robots keep clear of, so nothing in the room can cut
+ * through it, and at the distance a headset focuses best.
+ */
+const CARD_DISTANCE = 1.3;
+/** The gap between a card and the speech bubble beside it, as seen from the head (radians). */
+const CARD_GAP = 0.035;
+/**
+ * Where the robot stands while it holds a card up (radians left of straight
+ * ahead), if it was standing further right: its bubble then ends just right
+ * of centre and the card starts there, a short look to the side.
+ */
+const CARD_ROBOT = -0.2;
+/** How far from the visitor a robot stands to talk, in metres. */
+const TALK_DISTANCE = 2.0;
+/** The foot of the sign on the far wall, in metres: above the labels over the tubes. */
+const SIGN_FOOT = 2.2;
+/** A card's middle is this far above the visitor's eyes (metres): level with the speech bubble beside it, an easy height to read at. */
+const CARD_RISE = 0.11;
+/** A file card with no code to show: this wide, in metres. */
+const FILE_CARD_WIDTH = 0.8;
+/**
+ * How wide one character of code is on a card, in metres: about half a
+ * degree from where the visitor sits, which reads easily in a headset and
+ * lets a full line of code fit in one look.
+ */
+const CODE_CHAR = CARD_DISTANCE * Math.tan((0.54 * Math.PI) / 180);
+/** "Show me more", "the rest", "keep going": the next lines of the code already up (not "more about billing"). */
+const ASKS_FOR_MORE = /^(?!.*\b(?:about|another|other|different)\b).*\b(?:more|the rest|next (?:part|bit|lines?|page)|keep going|carry on|continue|further down|scroll)\b/i;
+/** If the code has not come after this long (ms), a card says what the file is for until it does. */
+const CODE_PATIENCE_MS = 900;
+
+/** What is held up beside a robot: a card of code, or a plain bubble about a file. */
+interface FileCard {
+  mesh: Mesh;
+  dispose(): void;
+  /** Called each frame while the card is up (a code card pops in). */
+  grow?(delta: number): void;
+}
 /** The shortest time a flow step's note stays up, even if the voice was cut off. */
 const MIN_NOTE_SECONDS = 2.5;
 /**
@@ -261,7 +305,13 @@ export class RoomSystem extends createSystem({
   private micOff = false;
   /** The visitor opened the question list while the mic is on (it is folded away otherwise). */
   private askOpen = false;
-  private fileCard: Bubble | null = null;
+  /** The file or code card held up beside the robot being talked to, and a count that outdates cards still being fetched. */
+  private fileCard: FileCard | null = null;
+  private cardToken = 0;
+  /** The code last held up in this conversation, so "show me more" can carry on from its last line. */
+  private lastCode: { path: string; shownTo: number } | null = null;
+  /** The room's info panel is put away while a card stands in its place. */
+  private inspectorAside = false;
   /** The notes room: the project's notes and their panel, and the newest notes pinned to the far wall. */
   private notesDesk!: NotesDesk;
   private notePlaques: Bubble[] = [];
@@ -462,22 +512,25 @@ export class RoomSystem extends createSystem({
 
     // The room's own files on plaques round the side and back walls, biggest first.
     const files = app.graph.files.filter((f) => f.n === nodeId).sort((a, b) => b.loc - a.loc).slice(0, 6);
-    const plaqueAngles = [118, -118, 145, -145, 172, -172];
+    // Behind the outermost tubes (which reach 118 degrees round with their labels)
+    // and clear of each other: three a side, a hand's width apart.
+    const plaqueAngles = [127, -127, 148, -148, 169, -169];
     files.forEach((f, i) => {
       const a = (plaqueAngles[i] * Math.PI) / 180;
-      const plaque = new Bubble(1.6, theme.accent, 4);
+      const plaque = new Bubble(1.5, theme.accent, 4);
       plaque.setText(`${f.d} (${f.loc} lines)`, f.name);
-      plaque.mesh.position.set(Math.sin(a) * (ROOM_RADIUS - 0.3), 1.7, -Math.cos(a) * (ROOM_RADIUS - 0.3));
+      this.hang(plaque.mesh, a, ROOM_RADIUS - 0.3, 1.7);
       group.add(plaque.mesh);
       this.bubbles.push(plaque);
     });
 
     // Room sign on the far wall, straight ahead.
-    const sign = new Bubble(2.2, theme.accent);
+    const sign = new Bubble(2.2, theme.accent, 5);
     const signTitle = `${notesRoom ? app.graph.project.name : node.label} · ${theme.place}`;
-    sign.setText(node.summary, signTitle);
     this.sign = { bubble: sign, text: node.summary, title: signTitle };
-    sign.mesh.position.set(0, 2.55, -(ROOM_RADIUS - 0.12));
+    // 2.2 m of flat card against a round wall: far enough in that its corners stay in front of it.
+    this.hang(sign.mesh, 0, ROOM_RADIUS - 0.2, SIGN_FOOT);
+    this.writeSign(node.summary);
     group.add(sign.mesh);
     this.bubbles.push(sign);
 
@@ -486,7 +539,7 @@ export class RoomSystem extends createSystem({
       this.notePlaques = [-27, 27, -46, 46].map((degrees) => {
         const a = (degrees * Math.PI) / 180;
         const plaque = new Bubble(1.5, theme.accent, 5);
-        plaque.mesh.position.set(Math.sin(a) * (ROOM_RADIUS - 0.3), 2.3, -Math.cos(a) * (ROOM_RADIUS - 0.3));
+        this.hang(plaque.mesh, a, ROOM_RADIUS - 0.3, 2.3);
         group.add(plaque.mesh);
         this.bubbles.push(plaque);
         return plaque;
@@ -497,7 +550,8 @@ export class RoomSystem extends createSystem({
     const logoUrl = app.graph.project.logo;
     if (logoUrl) {
       const logo = new Mesh(new PlaneGeometry(0.55, 0.55), new MeshBasicMaterial({ transparent: true }));
-      logo.position.set(-1.6, 2.55, -(ROOM_RADIUS - 0.14));
+      // On the wall to the left of the sign, between a pilaster and a window.
+      this.hang(logo, (-20.2 * Math.PI) / 180, ROOM_RADIUS - 0.15, 2.55);
       group.add(logo);
       void AssetManager.loadTexture(`${import.meta.env.BASE_URL}${logoUrl}`, `logo:${logoUrl}`).then((texture) => {
         texture.colorSpace = SRGBColorSpace;
@@ -578,7 +632,7 @@ export class RoomSystem extends createSystem({
       group.add(hole);
       const label = new Bubble(0.9, targetTheme.accent);
       label.setText(`to ${target.label}`, targetTheme.place);
-      label.mesh.position.set(mouth.x * 0.97, 1.95, mouth.z * 0.97);
+      this.hang(label.mesh, a, PORTAL_RADIUS * 0.97, 1.95);
       group.add(label.mesh);
       this.bubbles.push(label);
       const landing = new Vector3(Math.sin(a) * (PORTAL_RADIUS - 0.9), 0, -Math.cos(a) * (PORTAL_RADIUS - 0.9));
@@ -637,7 +691,7 @@ export class RoomSystem extends createSystem({
       const item = ignoreRays(makeItem(theme.item, palette));
       item.visible = false;
       rig.hands.add(item);
-      const bubble = new Bubble(1.2, theme.accent, 10);
+      const bubble = new Bubble(SPEECH_WIDTH, theme.accent, 10);
       bubble.mesh.position.set(0, 1.55, 0);
       rig.root.add(bubble.mesh);
       this.bubbles.push(bubble);
@@ -706,6 +760,24 @@ export class RoomSystem extends createSystem({
     if (handoff?.toRoom === nodeId) this.startConversation(this.workers[1], handoff);
     // The notes room is for talking: the note taker comes straight over.
     if (notesRoom) this.startConversation(this.workers[1]);
+  }
+
+  /**
+   * Hangs a card flat on the round wall at `angle`, facing the middle of the
+   * room. A card on the wall does not turn to follow the visitor's head:
+   * turned or tipped, a flat card's corners go through a curved wall.
+   */
+  private hang(card: Object3D, angle: number, radius: number, height: number): void {
+    card.position.set(Math.sin(angle) * radius, height, -Math.cos(angle) * radius);
+    card.rotation.set(0, -angle, 0);
+    card.userData.onWall = true;
+  }
+
+  /** Writes on the far wall's sign. It grows upwards from its foot, so a long one never reaches down over the tube labels. */
+  private writeSign(text: string): void {
+    if (!this.sign) return;
+    this.sign.bubble.setText(text, this.sign.title);
+    this.sign.bubble.mesh.position.y = SIGN_FOOT + this.sign.bubble.mesh.scale.y / 2;
   }
 
   private teardown(): void {
@@ -903,7 +975,7 @@ export class RoomSystem extends createSystem({
     // speech bubble at once, so there it stands almost straight ahead.
     const arc = placement.gaze ? TALK_ARC_NARROW : TALK_ARC;
     const angle = Math.max(-arc, Math.min(arc, Math.atan2(p.x, -p.z)));
-    const spot = new Vector3(Math.sin(angle) * 2.0, 0, -Math.cos(angle) * 2.0);
+    const spot = new Vector3(Math.sin(angle) * TALK_DISTANCE, 0, -Math.cos(angle) * TALK_DISTANCE);
     w.scripted = true;
     w.item.visible = false;
     // A colleague sent for from next door comes in through the pipe from there.
@@ -1162,7 +1234,7 @@ export class RoomSystem extends createSystem({
     this.quiz = { questions, index: 0, score: 0, missed: [], order: [0, 1, 2], marking: false, round: this.quizRounds };
     this.setAskText('quiz-label', 'Stop the quiz');
     // Closed book: the wall sign and the info card would give the answers away.
-    this.sign?.bubble.setText('Quiz in progress.', this.sign.title);
+    this.writeSign('Quiz in progress.');
     setQuiz(true);
     const count = questions.length === 1 ? 'One question' : `${questions.length} questions`;
     this.askQuizQuestion(`Quiz time. ${count} about this room. ${pressWord()} an answer, or say it. `);
@@ -1303,7 +1375,7 @@ export class RoomSystem extends createSystem({
     if (!this.quiz) return;
     this.quiz = null;
     this.waiting = false;
-    this.sign?.bubble.setText(this.sign.text, this.sign.title);
+    if (this.sign) this.writeSign(this.sign.text);
     setQuiz(false);
     if (!this.talking) return;
     this.showAskHeader(this.talking);
@@ -1319,12 +1391,17 @@ export class RoomSystem extends createSystem({
     const nodeId = this.builtNode;
     const persona = { name: w.name, role: this.theme.role, place: this.theme.place };
 
+    // "Show me more" means the rest of the code already held up. Asked in full,
+    // the robot answers about that file, and the card carries on from its last line.
+    const more = this.lastCode && ASKS_FOR_MORE.test(question) && question.length < 70 ? this.lastCode : null;
+    const asked = more ? `Show me the rest of ${more.path}, after line ${more.shownTo}.` : question;
+
     // React straight away and look busy while the model works.
     stopSpeaking();
-    const ack = this.say(w, thinkingLine(this.theme.id, question), this.titleFor(w)).then(() => {
+    const ack = this.say(w, thinkingLine(this.theme.id, asked), this.titleFor(w)).then(() => {
       if (this.waiting && this.talking === w) w.mood = 'thinking';
     });
-    const reply = await ask(app.mapId, app.graph, nodeId, persona, question, this.history);
+    const reply = await ask(app.mapId, app.graph, nodeId, persona, asked, this.history);
     // Left, or started over with someone else, while waiting: that already
     // reset `waiting`, and this answer belongs to nobody now.
     if (talk !== this.conversation) return;
@@ -1334,9 +1411,9 @@ export class RoomSystem extends createSystem({
     this.waiting = false;
     guideNote('asked');
 
-    this.history.push({ role: 'user', content: question }, { role: 'assistant', content: reply.answer });
-    const asked = new Set(this.history.filter((t) => t.role === 'user').map((t) => t.content));
-    const next = [...reply.followups, ...suggestedQuestions(app.graph, nodeId)].filter((q) => !asked.has(q));
+    this.history.push({ role: 'user', content: asked }, { role: 'assistant', content: reply.answer });
+    const already = new Set(this.history.filter((t) => t.role === 'user').map((t) => t.content));
+    const next = [...reply.followups, ...suggestedQuestions(app.graph, nodeId)].filter((q) => !already.has(q));
     this.questions = [...new Set(next)].slice(0, 4);
     this.showQuestions();
 
@@ -1361,7 +1438,9 @@ export class RoomSystem extends createSystem({
       if (import.meta.env.DEV) console.log(`[notes] added from ${w.name}: ${note.text.slice(0, 80)}`);
     }
     const file = reply.actions.find((a) => a.type === 'show_file');
-    if (file?.type === 'show_file') this.showFileCard(file.path, `${reply.answer} ${note?.type === 'add_note' ? note.text : ''}`);
+    const said = `${reply.answer} ${note?.type === 'add_note' ? note.text : ''}`;
+    if (more) this.showFileCard(more.path, { asked, said, after: more.shownTo });
+    else if (file?.type === 'show_file') this.showFileCard(file.path, { asked, said });
 
     const answer = reply.answer || 'Right this way.';
     const cuts = this.cutIns;
@@ -1448,37 +1527,102 @@ export class RoomSystem extends createSystem({
   }
 
   /**
-   * A card for one of the room's files, floating to the viewer's left. A file
-   * with a warning shows the flagged lines (maps built with code excerpts);
-   * with two warnings, the one the robot is talking about (`said`).
+   * Holds up one of the room's files beside the robot's speech bubble: the
+   * code that was asked for, in an editor's colours (the function or class
+   * named, the lines round a warning; see code-fetch.ts). When its lines
+   * cannot be had, or are slow to come, a card saying what the file is for.
    */
-  private showFileCard(path: string, said = ''): void {
+  private showFileCard(path: string, request: CodeRequest): void {
     const file = app.graph.files.find((f) => f.p === path);
     if (!file || !this.roomGroup || !this.theme) return;
     this.hideFileCard();
-    const issue = warningTalkedAbout(
-      (app.graph.health?.issues ?? []).filter((i) => i.excerpt && i.locations?.[0]?.file === path),
-      said,
-    );
-    const code = issue?.excerpt ? codeBlock(issue.excerpt) : undefined;
-    const card = new Bubble(0.7, this.theme.accent, code ? 3 : 8);
-    if (code && issue) {
-      // The flagged lines: just the file and the warning in words above them, so the card stays clear of the robot.
-      card.setText(`Line ${issue.locations?.[0]?.line ?? '?'}: ${issue.title}. (${file.p})`, `File: ${file.name}`, code);
-      card.mesh.position.set(CODE_CARD.x, CODE_CARD.y, CODE_CARD.z);
-    } else {
+    const token = this.cardToken;
+    const graph = app.graph;
+    const accent = this.theme.accent;
+    // Asked again, left the room or changed project meanwhile: this card is no longer wanted.
+    const wanted = () => token === this.cardToken && app.graph === graph && this.roomGroup !== null;
+    const plain = () => {
+      if (!wanted() || this.fileCard) return;
+      const card = new Bubble(FILE_CARD_WIDTH, accent, 8);
       card.setText(`${file.d} (${file.loc} lines, ${file.p})`, `File: ${file.name}`);
-      card.mesh.position.set(-0.32, 1.42, -1.15); // up and left of centre, clear of the side panels
-    }
-    this.roomGroup.add(card.mesh);
-    this.bubbles.push(card);
-    this.fileCard = card;
+      this.holdUp(card, card.mesh.scale.x, card.mesh.scale.y);
+    };
+    const patience = window.setTimeout(plain, CODE_PATIENCE_MS);
+    const source = { mapId: app.mapId, local: import.meta.env.DEV && app.mapId in CUSTOM_MAPS, base: import.meta.env.BASE_URL };
+    void findCode(graph, file, request, source).then((view) => {
+      window.clearTimeout(patience);
+      if (!wanted()) return;
+      if (!view) {
+        plain();
+        return;
+      }
+      this.dropFileCard();
+      const card = new CodeCard(view, accent, CODE_CHAR);
+      this.holdUp(card, card.width, card.height);
+      this.lastCode = { path: view.path, shownTo: view.shownTo };
+      if (import.meta.env.DEV) console.log(`[code] ${view.title} | ${view.where} | ${view.rows.length} rows x ${view.cols} cols`);
+    });
   }
 
+  /** Puts a card up beside the robot's bubble, with a small sound. */
+  private holdUp(card: FileCard, width: number, height: number): void {
+    if (!this.roomGroup) return;
+    this.placeCard(card.mesh, width);
+    this.roomGroup.add(card.mesh);
+    this.fileCard = card;
+    // The room's info panel stands where the card goes, and can be tall: it steps aside while the card is up.
+    setPanelShown(this.world, 'inspector-panel', false);
+    this.inspectorAside = true;
+    pop(this.worldPoint(card.mesh.position));
+    if (import.meta.env.DEV) console.log(`[card] ${width.toFixed(2)} x ${height.toFixed(2)} m at ${card.mesh.position.x.toFixed(2)}, ${card.mesh.position.y.toFixed(2)}, ${card.mesh.position.z.toFixed(2)}`);
+  }
+
+  /**
+   * Stands a card to the right of the speech bubble of the robot being talked
+   * to, never across it: the bubble's edge, a small gap, then the card,
+   * measured from where the visitor's head is now. On the right, each line of
+   * code starts on the side nearest the robot. A robot standing too far
+   * right for that first steps across to the left of centre.
+   */
+  private placeCard(card: Object3D, width: number): void {
+    const group = this.roomGroup;
+    if (!group) return;
+    const head = group.worldToLocal(this.world.camera.getWorldPosition(this.tmp));
+    let robot = 0;
+    let bubble = 0;
+    const w = this.talking;
+    if (w) {
+      // Where the robot stands to talk, or is still walking to.
+      const walk = w.queue.find((t) => t.kind === 'walk');
+      let at = walk?.kind === 'walk' ? walk.to : w.rig.root.position;
+      // A narrow view (glasses) keeps the robot straight ahead; the card is a turn of the head away.
+      if (!placement.gaze && Math.atan2(at.x, -at.z) > CARD_ROBOT + 0.03) {
+        at = new Vector3(Math.sin(CARD_ROBOT) * TALK_DISTANCE, 0, -Math.cos(CARD_ROBOT) * TALK_DISTANCE);
+        w.queue = w.queue.filter((t) => t.kind !== 'walk');
+        w.queue.unshift({ kind: 'walk', to: at }, { kind: 'face', at: new Vector3(0, 0, 0) });
+      }
+      const dx = at.x - head.x;
+      const dz = at.z - head.z;
+      robot = Math.atan2(dx, -dz);
+      bubble = Math.atan2(SPEECH_WIDTH / 2, Math.hypot(dx, dz));
+    }
+    const angle = robot + bubble + CARD_GAP + Math.atan2(width / 2, CARD_DISTANCE);
+    card.position.set(head.x + Math.sin(angle) * CARD_DISTANCE, head.y + CARD_RISE, head.z - Math.cos(angle) * CARD_DISTANCE);
+  }
+
+  /** Takes the card down, and forgets any card still on its way. */
   private hideFileCard(): void {
+    this.cardToken += 1;
+    this.dropFileCard();
+  }
+
+  private dropFileCard(): void {
+    if (this.inspectorAside) {
+      this.inspectorAside = false;
+      setPanelShown(this.world, 'inspector-panel', !app.menu);
+    }
     if (!this.fileCard) return;
     this.fileCard.mesh.removeFromParent();
-    this.bubbles = this.bubbles.filter((b) => b !== this.fileCard);
     this.fileCard.dispose();
     this.fileCard = null;
   }
@@ -1563,6 +1707,7 @@ export class RoomSystem extends createSystem({
     this.closeQuiz();
     stopSpeaking();
     this.hideFileCard();
+    this.lastCode = null;
     this.mic?.stop();
     this.updateMicLabel();
     this.showAskPanel(false);
@@ -1857,7 +2002,12 @@ export class RoomSystem extends createSystem({
     this.world.camera.getWorldDirection(this.headForward);
     this.headUp.set(0, 1, 0).applyQuaternion(this.world.camera.getWorldQuaternion(this.headQuat));
     setListener(this.head, this.headForward, this.headUp);
-    for (const b of this.bubbles) if (b.mesh.visible) b.mesh.lookAt(this.head);
+    // Floating bubbles turn to face the visitor; cards hung on the wall stay flat against it.
+    for (const b of this.bubbles) if (b.mesh.visible && !b.mesh.userData.onWall) b.mesh.lookAt(this.head);
+    if (this.fileCard) {
+      this.fileCard.mesh.lookAt(this.head);
+      this.fileCard.grow?.(delta);
+    }
 
     for (const w of this.workers) this.updateWorker(w, delta);
     this.separateWorkers();

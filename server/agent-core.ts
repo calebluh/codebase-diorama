@@ -1,6 +1,7 @@
 import {
   AGENT_TOOLS,
   asksForFix,
+  asksToSeeCode,
   fixNote,
   leavesRoom,
   parseReply,
@@ -283,6 +284,21 @@ export async function askAgent(req: AgentRequest, apiKey: string | undefined, mo
     const note = fixNote(reply.answer);
     if (note) actions.push({ type: 'add_note', text: note });
   }
+  // Asked to see code, the model often talks about the lines and opens no
+  // card, or opens another file than the one asked for. Show the file the
+  // visitor named, else the one the answer names, else the room's biggest.
+  if (asksToSeeCode(req.question)) {
+    // "Show me the code for billing day" asks for code, not to watch the Billing day flow.
+    actions = actions.filter((a) => a.type !== 'play_flow');
+    const asked = fileNamedIn(graph, req.nodeId, req.question);
+    const shown = actions.find((a) => a.type === 'show_file');
+    if (shown?.type === 'show_file') {
+      if (asked) shown.path = asked;
+    } else {
+      const path = asked ?? fileNamedIn(graph, req.nodeId, reply.answer) ?? roomFiles(graph, req.nodeId).sort((a, b) => b.loc - a.loc)[0]?.p;
+      if (path) actions.push({ type: 'show_file', path });
+    }
+  }
   return { ...reply, actions };
 }
 
@@ -307,6 +323,38 @@ export async function reviewProject(graph: GraphData, apiKey: string | undefined
     console.warn(`[review] wording skipped: ${(e as Error)?.message ?? e}`);
     return plainReview(graph, found); // slow or down: the findings stand as written
   }
+}
+
+/** The files kept in a room (and in the rooms inside it). */
+function roomFiles(graph: GraphData, nodeId: string): GraphData['files'] {
+  return graph.files.filter((f) => f.n === nodeId || graph.nodes.find((n) => n.id === f.n)?.parent === nodeId);
+}
+
+/**
+ * The room's file that `text` names: by its path, its file name, its
+ * plain-English name ("Stripe calls"), or a function or class in it
+ * ("runBilling", or said aloud, "run billing").
+ */
+function fileNamedIn(graph: GraphData, nodeId: string, text: string): string | null {
+  const own = roomFiles(graph, nodeId);
+  const said = text.toLowerCase();
+  const has = (name: string): boolean => name.length > 3 && new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(said);
+  const aloud = (name: string): string =>
+    name
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/[_-]+/g, ' ')
+      .toLowerCase();
+  const named =
+    own.find((f) => said.includes(f.p.toLowerCase())) ??
+    own.find((f) => has((f.p.split('/').pop() ?? '').toLowerCase())) ??
+    own.find((f) => has(f.name.toLowerCase())) ??
+    own.find((f) =>
+      (f.exports ?? []).some((e) => {
+        const name = e.replace(/ L\d+$/, '');
+        return has(name.toLowerCase()) || (aloud(name).includes(' ') && has(aloud(name)));
+      }),
+    );
+  return named?.p ?? null;
 }
 
 /**

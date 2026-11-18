@@ -7,6 +7,11 @@ room to room along the code's real flows. You can point at any robot and ask
 it a question, out loud or with a pinch, and it answers about your actual
 code.
 
+Ask a robot to show you the code and it holds up a card with the function,
+the class or the lines you named, whole, in an editor's colours. The card
+reads your files as they are on disk now, and nothing is uploaded. Say "show
+me more" to read on.
+
 Built with [Meta IWSDK](https://iwsdk.dev) (WebXR). Everything works with bare
 hands on a Meta Quest: point and pinch, or poke the panels with a fingertip.
 
@@ -127,6 +132,9 @@ you make one, a small sample shop called Larder is shown.
 - `src/workspace.ts`: where the desk goes. In mixed reality it finds a real
   table in the room (WebXR plane detection) and stands the city on it.
 - `src/rooms/`: the walk-in rooms, their themes, props and robot workers.
+  `src/rooms/code-*.ts` are the code cards: finding the function or class
+  that was asked for, colouring it and fitting it on a card.
+  `server/code-file.ts` reads the file from your project.
 - `src/agent/` and `server/`: the robots' conversations. Prompts are built on
   the server from the map, so the page never sees an API key.
 - `src/guide-system.ts`, `src/atmosphere.ts`, `src/transition.ts`: the guided
