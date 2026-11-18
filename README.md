@@ -8,9 +8,21 @@ it a question, out loud or with a pinch, and it answers about your actual
 code.
 
 Ask a robot to show you the code and it holds up a card with the function,
-the class or the lines you named, whole, in an editor's colours. The card
-reads your files as they are on disk now, and nothing is uploaded. Say "show
-me more" to read on.
+the class or the lines you named, whole, in an editor's colours, read from
+your files as they are on disk now. The robot reads the same lines before it
+answers, so it tells you what the code does, cites line numbers and bases
+fixes on them; "what does line 41 do?" gets a real answer. Say "show me
+more" to read on. The note taker does the same for an idea you talk over:
+it looks the idea up in your code and ends the note with the file and
+function to change, so your coding agent can go straight there.
+
+Your files stay on your computer. The lines a question or an idea is about
+are sent, with the question, to whichever model answers for the robots (see
+[Who answers for the robots](#who-answers-for-the-robots)); nothing else is.
+
+Every panel, card and speech bubble has a small grab bar: pinch it to put
+that thing where you want it. It keeps facing you, and Recenter puts
+everything back.
 
 Built with [Meta IWSDK](https://iwsdk.dev) (WebXR). Everything works with bare
 hands on a Meta Quest: point and pinch, or poke the panels with a fingertip.
