@@ -1,4 +1,4 @@
-# Codebase Diorama
+# Walkthrough
 
 Step inside your codebase. Your project becomes a little city on your desk in
 VR: every part of the code is a building, and you can walk into any of them.
@@ -20,13 +20,13 @@ the map and starts the viewer. One skill, packaged for each agent:
 
 | Agent | Install | Then ask |
 | --- | --- | --- |
-| Claude Code | `claude plugin marketplace add calebluh/codebase-diorama` then `claude plugin install codebase-diorama@codebase-diorama` | `/codebase-diorama:map` |
-| Codex and the ChatGPT desktop app | `codex plugin marketplace add calebluh/codebase-diorama`, then install **codebase-diorama** from the plugins list | "Map this repo into a Codebase Diorama" |
-| Cursor | `npx skills add calebluh/codebase-diorama --skill codebase-diorama -a cursor` | "Map this repo into a Codebase Diorama" |
-| Gemini CLI | `gemini extensions install https://github.com/calebluh/codebase-diorama` | "Map this repo into a Codebase Diorama" |
-| Antigravity | `npx skills add calebluh/codebase-diorama --skill codebase-diorama -a antigravity` | "Map this repo into a Codebase Diorama" |
-| GitHub Copilot, OpenCode, Windsurf and others | `npx skills add calebluh/codebase-diorama --skill codebase-diorama` (it finds the agents you have) | "Map this repo into a Codebase Diorama" |
-| Anything else that can run a shell | nothing | "Read https://raw.githubusercontent.com/calebluh/codebase-diorama/main/skills/codebase-diorama/SKILL.md and follow it for this repository." |
+| Claude Code | `claude plugin marketplace add calebluh/codebase-diorama` then `claude plugin install walkthrough@walkthrough` | `/walkthrough:map` |
+| Codex and the ChatGPT desktop app | `codex plugin marketplace add calebluh/codebase-diorama`, then install **walkthrough** from the plugins list | "Map this repo into a Walkthrough city" |
+| Cursor | `npx skills add calebluh/codebase-diorama --skill walkthrough -a cursor` | "Map this repo into a Walkthrough city" |
+| Gemini CLI | `gemini extensions install https://github.com/calebluh/codebase-diorama` | "Map this repo into a Walkthrough city" |
+| Antigravity | `npx skills add calebluh/codebase-diorama --skill walkthrough -a antigravity` | "Map this repo into a Walkthrough city" |
+| GitHub Copilot, OpenCode, Windsurf and others | `npx skills add calebluh/codebase-diorama --skill walkthrough` (it finds the agents you have) | "Map this repo into a Walkthrough city" |
+| Anything else that can run a shell | nothing | "Read https://raw.githubusercontent.com/calebluh/codebase-diorama/main/skills/walkthrough/SKILL.md and follow it for this repository." |
 
 Add `-g` to an `npx skills add` line to install for every project instead of
 the current one. The agent has to run on your own computer: it uses git and
@@ -34,7 +34,7 @@ Node there, and the headset reaches the viewer over your Wi-Fi.
 
 The skill is written once, in
 [`plugins/codebase-diorama/skills/map`](plugins/codebase-diorama/skills/map),
-and copied to [`skills/codebase-diorama`](skills/codebase-diorama) for agents
+and copied to [`skills/walkthrough`](skills/walkthrough) for agents
 that install bare skills (`node scripts/sync-skills.mjs`).
 
 ## MCP server: the same tools in any agent
@@ -46,13 +46,13 @@ agent that speaks MCP these tools:
 
 | Tool | What it does |
 | --- | --- |
-| `diorama_instructions` | The mapping skill and map format, for agents that do not load skills |
-| `diorama_setup` | Clones this viewer to `~/codebase-diorama` and installs it |
-| `diorama_build_map` | Builds and checks a map once the agent has written it |
-| `diorama_use_brain` | Robots answer through your Claude plan, or Meta's Model API |
-| `diorama_start` / `diorama_stop` | Runs the viewer and returns the link for your Quest |
-| `diorama_status` | Maps, open notes, who answers, and whether the viewer is running |
-| `diorama_notes` / `diorama_tick_note` | The notes you made in VR, and ticking them off as they are done |
+| `walkthrough_instructions` | The mapping skill and map format, for agents that do not load skills |
+| `walkthrough_setup` | Clones this viewer to `~/codebase-diorama` and installs it |
+| `walkthrough_build_map` | Builds and checks a map once the agent has written it |
+| `walkthrough_use_brain` | Robots answer through your Claude plan, or Meta's Model API |
+| `walkthrough_start` / `walkthrough_stop` | Runs the viewer and returns the link for your Quest |
+| `walkthrough_status` | Maps, open notes, who answers, and whether the viewer is running |
+| `walkthrough_notes` / `walkthrough_tick_note` | The notes you made in VR, and ticking them off as they are done |
 
 It also has two prompts, `map_repo` and `work_through_notes`.
 
@@ -146,7 +146,7 @@ you make one, a small sample shop called Larder is shown.
 
 Copyright (C) 2026 Caleb Luh.
 
-Codebase Diorama is free software under the
+Walkthrough is free software under the
 [GNU Affero General Public License v3.0](LICENSE) or any later version. You
 can use, change and share it. If you share a changed version, or run one as a
 service other people use over a network, you must make your changed source

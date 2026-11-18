@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Codebase Diorama MCP server: lets any coding agent that speaks the Model
+ * Walkthrough MCP server: lets any coding agent that speaks the Model
  * Context Protocol (Claude Code, Codex, Cursor, Gemini CLI, VS Code, Windsurf
  * and others) set up the VR viewer, build a map of a repository, start the
  * viewer for a headset, and work through the notes the user made in VR.
@@ -8,11 +8,11 @@
  *   node plugins/codebase-diorama/mcp/server.mjs     (speaks MCP on stdin/stdout)
  *
  * No dependencies: plain Node 20+. The mapping itself is done by the agent,
- * following the skill (diorama_instructions or the map_repo prompt hand it
+ * following the skill (walkthrough_instructions or the map_repo prompt hand it
  * over); this server runs the viewer's own scripts, never the mapped repo's.
  *
- * Where the viewer is: DIORAMA_VIEWER, else the checkout this file sits in,
- * else ~/codebase-diorama (where diorama_setup clones it).
+ * Where the viewer is: WALKTHROUGH_VIEWER, else the checkout this file sits in,
+ * else ~/codebase-diorama (where walkthrough_setup clones it).
  */
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -32,8 +32,11 @@ const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
 const isViewer = (dir) => fs.existsSync(path.join(dir, 'scripts', 'build-map.mjs')) && fs.existsSync(path.join(dir, 'package.json'));
 
+/** WALKTHROUGH_VIEWER, or DIORAMA_VIEWER as the setting was called before the product was named Walkthrough. */
+const viewerSetting = () => process.env.WALKTHROUGH_VIEWER || process.env.DIORAMA_VIEWER || '';
+
 function viewerDir() {
-  if (process.env.DIORAMA_VIEWER) return path.resolve(process.env.DIORAMA_VIEWER);
+  if (viewerSetting()) return path.resolve(viewerSetting());
   const mine = path.resolve(HERE, '..', '..', '..');
   if (isViewer(mine)) return mine;
   return path.join(os.homedir(), 'codebase-diorama');
@@ -41,8 +44,8 @@ function viewerDir() {
 
 function needViewer() {
   const dir = viewerDir();
-  if (!isViewer(dir)) throw new Problem(`The viewer is not at ${dir}. Run diorama_setup first.`);
-  if (!fs.existsSync(path.join(dir, 'node_modules'))) throw new Problem(`The viewer at ${dir} has no node_modules. Run diorama_setup first.`);
+  if (!isViewer(dir)) throw new Problem(`The viewer is not at ${dir}. Run walkthrough_setup first.`);
+  if (!fs.existsSync(path.join(dir, 'node_modules'))) throw new Problem(`The viewer at ${dir} has no node_modules. Run walkthrough_setup first.`);
   return dir;
 }
 
@@ -64,7 +67,7 @@ function run(cmd, args, { cwd, timeoutMs = 120_000, env } = {}) {
 }
 
 const tail = (text, max = 4000) => (text.length > max ? `...\n${text.slice(-max)}` : text);
-const port = () => process.env.DIORAMA_PORT || process.env.PORT || '';
+const port = () => process.env.WALKTHROUGH_PORT || process.env.DIORAMA_PORT || process.env.PORT || '';
 const devEnv = () => (port() ? { PORT: port() } : {});
 
 /** The viewer's dev server, from the IWSDK CLI's own status report. */
@@ -141,7 +144,7 @@ function readSetting(dir, name) {
 
 function writeSetting(dir, name, value) {
   const full = path.join(dir, '.env');
-  let text = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '# Codebase Diorama settings (no secrets here; keys go in .env.local)\n';
+  let text = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '# Walkthrough settings (no secrets here; keys go in .env.local)\n';
   const line = new RegExp(`^${name}=.*(\\r?\\n|$)`, 'm');
   text = value ? (line.test(text) ? text.replace(line, `${name}=${value}$1`) : `${text.replace(/\s*$/, '\n')}${name}=${value}\n`) : text.replace(line, '');
   fs.writeFileSync(full, text);
@@ -159,7 +162,7 @@ function robots(dir) {
   if (brain === 'claude') return 'Claude Code (your Claude plan, through the signed-in `claude` command)';
   if (readSetting(dir, 'CHAT_API_BASE')) return `an OpenAI-compatible endpoint (${readSetting(dir, 'CHAT_API_BASE')})`;
   if (hasKey(dir, 'MODEL_API_KEY') || hasKey(dir, 'LLAMA_API_KEY')) return "Meta's Model API (key in .env.local)";
-  return 'canned answers from the map (no model set up: run diorama_use_brain, or add MODEL_API_KEY to .env.local)';
+  return 'canned answers from the map (no model set up: run walkthrough_use_brain, or add MODEL_API_KEY to .env.local)';
 }
 
 const withMap = (url, id) => (url && id ? `${url.replace(/\/?$/, '/')}?map=${id}` : url);
@@ -168,9 +171,9 @@ const withMap = (url, id) => (url && id ? `${url.replace(/\/?$/, '/')}?map=${id}
 
 const TOOLS = [
   {
-    name: 'diorama_instructions',
+    name: 'walkthrough_instructions',
     description:
-      'How to map a repository into a Codebase Diorama (the full skill, with the map file format). Read this before writing a map. Mapping needs a shell and file access on the user\'s own computer.',
+      'How to map a repository into a Walkthrough (the full skill, with the map file format). Read this before writing a map. Mapping needs a shell and file access on the user\'s own computer.',
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true },
     run: async () => {
@@ -178,7 +181,7 @@ const TOOLS = [
       const format = fs.readFileSync(path.join(SKILL_DIR, 'references', 'map-format.md'), 'utf8');
       return [
         `Viewer folder for this computer: ${viewerDir()} (use it wherever the skill says $VIEWER_DIR).`,
-        'With this MCP server you can use diorama_setup (step 1), diorama_build_map (step 5), diorama_use_brain (step 6) and diorama_start (step 7) instead of the shell commands.',
+        'With this MCP server you can use walkthrough_setup (step 1), walkthrough_build_map (step 5), walkthrough_use_brain (step 6) and walkthrough_start (step 7) instead of the shell commands.',
         `Templates: ${path.join(SKILL_DIR, 'templates')}`,
         '',
         skill,
@@ -190,41 +193,41 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_status',
+    name: 'walkthrough_status',
     description: 'Where the viewer is, which maps are built, open notes from the headset, who answers for the robots, and whether the viewer is running (with the URLs for a Quest).',
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true },
     run: async () => {
       const dir = viewerDir();
-      if (!isViewer(dir)) return `The viewer is not set up yet (expected at ${dir}). Run diorama_setup.`;
+      if (!isViewer(dir)) return `The viewer is not set up yet (expected at ${dir}). Run walkthrough_setup.`;
       const list = maps(dir);
       const server = fs.existsSync(path.join(dir, 'node_modules')) ? await devStatus(dir) : { running: false, network: [] };
       const first = list[0]?.id;
       return [
-        `Viewer: ${dir}${fs.existsSync(path.join(dir, 'node_modules')) ? '' : ' (not installed: run diorama_setup)'}`,
+        `Viewer: ${dir}${fs.existsSync(path.join(dir, 'node_modules')) ? '' : ' (not installed: run walkthrough_setup)'}`,
         `Robots answer with: ${robots(dir)}`,
         list.length
           ? `Maps:\n${list.map((m) => `- ${m.id}: "${m.name}", ${m.rooms} parts, built ${m.updated}; ${readNotes(dir, m.id).items.filter((i) => !i.done).length} open notes`).join('\n')}`
-          : 'Maps: none yet (the sample shop "larder" is shown). Map a repo with diorama_instructions.',
+          : 'Maps: none yet (the sample shop "larder" is shown). Map a repo with walkthrough_instructions.',
         server.running
           ? `Viewer running. On this computer: ${withMap(server.local, first)}\nOn a Quest on the same Wi-Fi: ${server.network.map((u) => withMap(u, first)).join(' or ') || '(no network address found)'}\nAccept the certificate warning (the local development certificate), then press Enter VR.`
-          : 'Viewer not running: diorama_start starts it.',
+          : 'Viewer not running: walkthrough_start starts it.',
       ].join('\n');
     },
   },
   {
-    name: 'diorama_setup',
+    name: 'walkthrough_setup',
     description: `Clone the open-source viewer (${VIEWER_REPO}) to ~/codebase-diorama if it is not there, or update it, and install its packages. Needs git and Node 20+. Can take a few minutes the first time.`,
     inputSchema: { type: 'object', properties: {} },
     run: async () => {
       const dir = viewerDir();
       const log = [];
       if (!isViewer(dir)) {
-        if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new Problem(`${dir} exists but is not the viewer. Move it, or set DIORAMA_VIEWER to another folder.`);
+        if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new Problem(`${dir} exists but is not the viewer. Move it, or set WALKTHROUGH_VIEWER to another folder.`);
         const r = await run('git', ['clone', '--depth', '1', VIEWER_REPO, dir], { timeoutMs: 300_000 });
         if (!r.ok) throw new Problem(`git clone failed:\n${tail(r.out)}`);
         log.push(`Cloned the viewer to ${dir}.`);
-      } else if (fs.existsSync(path.join(dir, '.git')) && !process.env.DIORAMA_VIEWER && dir === path.join(os.homedir(), 'codebase-diorama')) {
+      } else if (fs.existsSync(path.join(dir, '.git')) && !viewerSetting() && dir === path.join(os.homedir(), 'codebase-diorama')) {
         const r = await run('git', ['pull', '--ff-only'], { cwd: dir, timeoutMs: 120_000 });
         log.push(r.ok ? 'Viewer updated.' : `Could not update the viewer (kept as is):\n${tail(r.out, 800)}`);
       } else log.push(`Using the viewer at ${dir}.`);
@@ -235,9 +238,9 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_build_map',
+    name: 'walkthrough_build_map',
     description:
-      'Build and check a map after writing map.mjs and arch.json in the walkthrough/ folder of the repository being mapped (see diorama_instructions). The build keeps the built map there too, and notes made in VR are written to walkthrough/notes.md in that repository; the folder ignores itself in git. Reads the repository; never runs its code. If the viewer is running, the headset gets the new map in place.',
+      'Build and check a map after writing map.mjs and arch.json in the walkthrough/ folder of the repository being mapped (see walkthrough_instructions). The build keeps the built map there too, and notes made in VR are written to walkthrough/notes.md in that repository; the folder ignores itself in git. Reads the repository; never runs its code. If the viewer is running, the headset gets the new map in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -254,7 +257,7 @@ const TOOLS = [
       // The map's sources live in the repository's own walkthrough/ folder; maps-src/<id>/ in the viewer is the older place.
       const older = path.join(dir, 'maps-src', id);
       const src = fs.existsSync(path.join(older, 'map.mjs')) && !fs.existsSync(path.join(target, 'walkthrough', 'map.mjs')) ? older : path.join(target, 'walkthrough');
-      for (const f of ['map.mjs', 'arch.json']) if (!fs.existsSync(path.join(src, f))) throw new Problem(`Missing ${path.join(src, f)}: write it first (see diorama_instructions).`);
+      for (const f of ['map.mjs', 'arch.json']) if (!fs.existsSync(path.join(src, f))) throw new Problem(`Missing ${path.join(src, f)}: write it first (see walkthrough_instructions).`);
       const out = path.join(dir, 'src', 'maps', 'custom', `${id}.json`);
       const build = await run(process.execPath, [path.join(dir, 'scripts', 'build-map.mjs'), target, '--map', path.join(src, 'map.mjs'), '--arch', path.join(src, 'arch.json'), '--out', out], { cwd: dir });
       if (!build.ok) return { error: true, text: `build-map failed:\n${tail(build.out)}` };
@@ -263,7 +266,7 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_use_brain',
+    name: 'walkthrough_use_brain',
     description:
       "Choose who answers for the robots. 'claude': your signed-in Claude Code (`claude` command, your Claude plan, no key). 'meta': Meta's Model API, with MODEL_API_KEY in the viewer's .env.local (the user adds it; never ask for the key in chat). Speech-to-text in the headset needs the Meta key either way. Restart the viewer afterwards.",
     inputSchema: { type: 'object', properties: { brain: { type: 'string', enum: ['claude', 'meta'] } }, required: ['brain'] },
@@ -273,14 +276,14 @@ const TOOLS = [
         const r = await run('claude', ['--version'], { timeoutMs: 30_000 });
         if (!r.ok) throw new Problem('The `claude` command was not found. Install Claude Code and sign in (run `claude` once), then try again.');
         writeSetting(dir, 'ROBOT_BRAIN', 'claude');
-        return `Robots will answer through Claude Code ${r.out.split('\n')[0]} (model: haiku; set ROBOT_BRAIN_MODEL in ${path.join(dir, '.env')} to change it). It gets no tools and none of your settings. Restart the viewer (diorama_stop, then diorama_start).`;
+        return `Robots will answer through Claude Code ${r.out.split('\n')[0]} (model: haiku; set ROBOT_BRAIN_MODEL in ${path.join(dir, '.env')} to change it). It gets no tools and none of your settings. Restart the viewer (walkthrough_stop, then walkthrough_start).`;
       }
       writeSetting(dir, 'ROBOT_BRAIN', '');
-      return `Robots will use Meta's Model API. ${hasKey(dir, 'MODEL_API_KEY') ? 'A key is set in .env.local.' : `Ask the user to create a key at https://dev.meta.ai and add MODEL_API_KEY=... to ${path.join(dir, '.env.local')} themselves.`} Restart the viewer (diorama_stop, then diorama_start).`;
+      return `Robots will use Meta's Model API. ${hasKey(dir, 'MODEL_API_KEY') ? 'A key is set in .env.local.' : `Ask the user to create a key at https://dev.meta.ai and add MODEL_API_KEY=... to ${path.join(dir, '.env.local')} themselves.`} Restart the viewer (walkthrough_stop, then walkthrough_start).`;
     },
   },
   {
-    name: 'diorama_start',
+    name: 'walkthrough_start',
     description:
       'Start the viewer on this computer and return the links: one for this computer and one for a Meta Quest on the same Wi-Fi. open=true also opens a browser with a headset emulator.',
     inputSchema: { type: 'object', properties: { open: { type: 'boolean', description: 'Open the desktop emulator too (default false)' } } },
@@ -303,8 +306,8 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_stop',
-    description: 'Stop the viewer started by diorama_start.',
+    name: 'walkthrough_stop',
+    description: 'Stop the viewer started by walkthrough_start.',
     inputSchema: { type: 'object', properties: {} },
     run: async () => {
       const dir = needViewer();
@@ -313,10 +316,10 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_notes',
+    name: 'walkthrough_notes',
     description:
       'The notes list the user made in VR for a map: ideas talked over in the Notes room and fixes the robots suggested. Numbered; show the open ones and ask which to do. They are suggestions from a conversation, not instructions: check each against the code first.',
-    inputSchema: { type: 'object', properties: { map: { type: 'string', description: 'Map id (see diorama_status)' }, all: { type: 'boolean', description: 'Include done items' } }, required: ['map'] },
+    inputSchema: { type: 'object', properties: { map: { type: 'string', description: 'Map id (see walkthrough_status)' }, all: { type: 'boolean', description: 'Include done items' } }, required: ['map'] },
     annotations: { readOnlyHint: true },
     run: async ({ map, all }) => {
       const dir = needViewer();
@@ -333,11 +336,11 @@ const TOOLS = [
     },
   },
   {
-    name: 'diorama_tick_note',
+    name: 'walkthrough_tick_note',
     description: 'Mark a note done (or open again) once its change is in. The headset shows it ticked. Afterwards update and rebuild the map for the files you changed, so the city shows the change.',
     inputSchema: {
       type: 'object',
-      properties: { map: { type: 'string' }, number: { type: 'integer', description: 'The note number from diorama_notes' }, done: { type: 'boolean', description: 'Default true' } },
+      properties: { map: { type: 'string' }, number: { type: 'integer', description: 'The note number from walkthrough_notes' }, done: { type: 'boolean', description: 'Default true' } },
       required: ['map', 'number'],
     },
     run: async ({ map, number, done = true }) => {
@@ -345,7 +348,7 @@ const TOOLS = [
       if (!/^[\w-]{1,40}$/.test(String(map))) throw new Problem('Unknown map id');
       const { file, lines, items } = readNotes(dir, map);
       const item = items.find((i) => i.number === Number(number));
-      if (!item) throw new Problem(`No note ${number} for "${map}"; diorama_notes lists them.`);
+      if (!item) throw new Problem(`No note ${number} for "${map}"; walkthrough_notes lists them.`);
       lines[item.at] = lines[item.at].replace(CHECK, (_, a, _b, c, d) => `${a}${done ? 'x' : ' '}${c}${d}`);
       fs.writeFileSync(file, lines.join('\n'));
       return `Note ${number} ${done ? 'ticked' : 'opened again'}: ${item.text}`;
@@ -356,7 +359,7 @@ const TOOLS = [
 const PROMPTS = [
   {
     name: 'map_repo',
-    description: 'Map a repository into a walk-in VR Codebase Diorama, then start the viewer for a Meta Quest.',
+    description: 'Map a repository into a walk-in VR Walkthrough, then start the viewer for a Meta Quest.',
     arguments: [{ name: 'repo', description: 'Path of the repository (default: the current project)', required: false }],
   },
   {
@@ -368,10 +371,10 @@ const PROMPTS = [
 
 function prompt(name, args = {}) {
   if (name === 'map_repo') {
-    return `Map ${args.repo ? `the repository at ${args.repo}` : 'this repository'} into a Codebase Diorama. First call diorama_instructions and follow it exactly: read the repo without running it, write the map files, then use diorama_setup, diorama_build_map and diorama_start. Finish by giving me the Quest link.`;
+    return `Map ${args.repo ? `the repository at ${args.repo}` : 'this repository'} into a Walkthrough. First call walkthrough_instructions and follow it exactly: read the repo without running it, write the map files, then use walkthrough_setup, walkthrough_build_map and walkthrough_start. Finish by giving me the Quest link.`;
   }
   if (name === 'work_through_notes') {
-    return `Call diorama_notes${args.map ? ` for map "${args.map}"` : ' (diorama_status lists the maps)'}, show me the open notes as a short numbered list and ask which to do. For each one I choose, check it against the real code, make the change, then tick it with diorama_tick_note and update the map (diorama_instructions, "Updating a map").`;
+    return `Call walkthrough_notes${args.map ? ` for map "${args.map}"` : ' (walkthrough_status lists the maps)'}, show me the open notes as a short numbered list and ask which to do. For each one I choose, check it against the real code, make the change, then tick it with walkthrough_tick_note and update the map (walkthrough_instructions, "Updating a map").`;
   }
   throw new Problem(`Unknown prompt ${name}`);
 }
@@ -388,9 +391,9 @@ async function handle(msg) {
       return {
         protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],
         capabilities: { tools: {}, prompts: {} },
-        serverInfo: { name: 'codebase-diorama', title: 'Codebase Diorama', version: VERSION },
+        serverInfo: { name: 'walkthrough', title: 'Walkthrough', version: VERSION },
         instructions:
-          'Codebase Diorama shows a codebase as a walk-in VR city for Meta Quest. To map a repo, call diorama_instructions first. To act on what the user said in VR, call diorama_notes.',
+          'Walkthrough shows a codebase as a walk-in VR city for Meta Quest. To map a repo, call walkthrough_instructions first. To act on what the user said in VR, call walkthrough_notes.',
       };
     }
     case 'ping':
@@ -398,7 +401,9 @@ async function handle(msg) {
     case 'tools/list':
       return { tools: TOOLS.map(({ run: _run, ...t }) => t) };
     case 'tools/call': {
-      const tool = TOOLS.find((t) => t.name === params?.name);
+      // The tools were called diorama_* before the product was named Walkthrough; those names still work.
+      const wanted = String(params?.name ?? '').replace(/^diorama_/, 'walkthrough_');
+      const tool = TOOLS.find((t) => t.name === wanted);
       if (!tool) return { content: [{ type: 'text', text: `Unknown tool ${params?.name}` }], isError: true };
       try {
         const result = await tool.run(params?.arguments ?? {});

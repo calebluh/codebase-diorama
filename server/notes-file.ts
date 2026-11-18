@@ -22,7 +22,7 @@ import { basename, isAbsolute, join } from 'node:path';
 /** The folder kept in a mapped repository. */
 export const PROJECT_FOLDER = 'walkthrough';
 
-const IGNORE = '# Made by Codebase Diorama: the map of this repository and your notes from VR.\n# Nothing in this folder needs committing, so the folder ignores itself.\n*\n';
+const IGNORE = '# Made by Walkthrough: the map of this repository and your notes from VR.\n# Nothing in this folder needs committing, so the folder ignores itself.\n*\n';
 
 /** The repository a map was built from, when build-map recorded it and the folder is still there. */
 export function projectDirFor(viewerDir: string, mapId: string): string | null {

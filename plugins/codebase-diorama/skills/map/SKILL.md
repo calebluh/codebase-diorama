@@ -1,11 +1,11 @@
 ---
 name: map
-description: Turn a codebase into a walk-in VR diorama (Codebase Diorama for Meta Quest). Use when the user asks to map, visualize, tour or "step inside" a repository in VR or on a Quest, to build a Codebase Diorama map, or runs /codebase-diorama:map. Analyzes the repo read-only, writes a map of its parts, flows and files in plain English, then runs the viewer locally so robots in each room can answer questions about the code. Needs a shell with git and Node 20+ on the user's own machine.
+description: Turn a codebase into a walk-in VR diorama (Walkthrough for Meta Quest). Use when the user asks to map, visualize, tour or "step inside" a repository in VR or on a Quest, to build a Walkthrough map, or runs /walkthrough:map. Analyzes the repo read-only, writes a map of its parts, flows and files in plain English, then runs the viewer locally so robots in each room can answer questions about the code. Needs a shell with git and Node 20+ on the user's own machine.
 ---
 
-# Codebase Diorama: map a repo
+# Walkthrough: map a repo
 
-Codebase Diorama shows a codebase as a little city on a desk in VR. Each part
+Walkthrough shows a codebase as a little city on a desk in VR. Each part
 of the code is a building; step inside one and it becomes a themed room where
 robot workers run that part and answer questions about it, powered by the
 user's own Claude Code sign-in or Meta Model API key (step 6). Packets travel
@@ -159,9 +159,9 @@ model the robots still talk, from canned answers built from your
 descriptions. Optional: `OPENAI_API_KEY=...` in `.env.local` gives each robot
 a natural voice (otherwise the browser's built-in voice is used).
 
-If you have the Codebase Diorama MCP tools (`diorama_*`), `diorama_use_brain`
-makes this change for you, and `diorama_setup`, `diorama_build_map`,
-`diorama_start` and `diorama_notes` stand in for the shell commands in
+If you have the Walkthrough MCP tools (`walkthrough_*`), `walkthrough_use_brain`
+makes this change for you, and `walkthrough_setup`, `walkthrough_build_map`,
+`walkthrough_start` and `walkthrough_notes` stand in for the shell commands in
 steps 1, 5 and 7 and the notes section below.
 
 ## 7. Launch

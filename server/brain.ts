@@ -34,7 +34,7 @@ export interface Brain {
 
 /** Said once to every process; the real instructions come with each request. */
 const STANDING =
-  'You speak for the worker robots in Codebase Diorama, a VR app that shows a codebase as a building of rooms. ' +
+  'You speak for the worker robots in Walkthrough, a VR app that shows a codebase as a building of rooms. ' +
   'Each message is one self-contained request: the room instructions, then the conversation so far. ' +
   'Follow the room instructions exactly and write only the reply they ask for: no preamble, no markdown, no code blocks.';
 

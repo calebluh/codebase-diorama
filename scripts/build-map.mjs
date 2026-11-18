@@ -298,8 +298,8 @@ if (path.basename(path.dirname(out)) === 'custom') {
   const keep = (name, text) => {
     if (!fs.existsSync(path.join(folder, name))) fs.writeFileSync(path.join(folder, name), text);
   };
-  keep('.gitignore', '# Made by Codebase Diorama: the map of this repository and your notes from VR.\n# Nothing in this folder needs committing, so the folder ignores itself.\n*\n');
-  keep('README.md', '# walkthrough/\n\nMade by Codebase Diorama, the VR walk-through of this codebase. Nothing in here\nneeds committing: the folder ignores itself in git.\n\n- `notes.md`: your notes from VR as a checklist: ideas you talked over, fixes\n  the robots suggested and the note taker\'s review. Start here.\n- `map.mjs` and `arch.json`: how this repository is described for the map (its\n  parts, files, journeys and warnings). Edit them and rebuild to change what\n  the city shows.\n- `graph.json`: the built map the viewer shows.\n');
+  keep('.gitignore', '# Made by Walkthrough: the map of this repository and your notes from VR.\n# Nothing in this folder needs committing, so the folder ignores itself.\n*\n');
+  keep('README.md', '# walkthrough/\n\nMade by Walkthrough, the VR walk-through of this codebase. Nothing in here\nneeds committing: the folder ignores itself in git.\n\n- `notes.md`: your notes from VR as a checklist: ideas you talked over, fixes\n  the robots suggested and the note taker\'s review. Start here.\n- `map.mjs` and `arch.json`: how this repository is described for the map (its\n  parts, files, journeys and warnings). Edit them and rebuild to change what\n  the city shows.\n- `graph.json`: the built map the viewer shows.\n');
   fs.writeFileSync(path.join(folder, 'graph.json'), JSON.stringify(graph, null, 1));
   const viewer = path.resolve(path.dirname(process.argv[1]), '..');
   const targetsFile = path.join(viewer, 'maps-src', 'targets.json');
